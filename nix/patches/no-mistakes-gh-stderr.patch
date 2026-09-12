@@ -1,0 +1,180 @@
+diff --git a/internal/scm/github/github.go b/internal/scm/github/github.go
+index 18da4df..fa31994 100644
+--- a/internal/scm/github/github.go
++++ b/internal/scm/github/github.go
+@@ -111,6 +111,30 @@ func HostPrefixedSlugForHost(remoteURL, host string) string {
+ 	return host + "/" + slug
+ }
+ 
++// ghOutput runs cmd and returns its stdout ALONE, plus a human-readable detail
++// string for error messages.
++//
++// stdout must stay clean because callers below either json.Unmarshal it or take
++// the trimmed bytes as the value itself. gh is frequently reached through a
++// wrapper — a secret broker, a corporate proxy, an approval gate — and those
++// wrappers announce themselves on stderr on every single invocation. Folding
++// stderr into stdout puts that notice in front of the JSON, so the parse fails
++// on a run where gh itself succeeded and exited 0.
++//
++// The detail string keeps the old diagnostics: stderr when the command failed
++// (that is where gh writes its errors), stdout otherwise.
++func ghOutput(cmd *exec.Cmd) (stdout []byte, detail string, err error) {
++	out, err := cmd.Output()
++	detail = strings.TrimSpace(string(out))
++	var exitErr *exec.ExitError
++	if errors.As(err, &exitErr) {
++		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
++			detail = stderr
++		}
++	}
++	return out, detail, err
++}
++
+ // repoArgs returns the --repo flag pair when the slug is known, so gh commands
+ // resolve the right repository regardless of the process working directory.
+ func (h *Host) repoArgs() []string {
+@@ -193,9 +217,9 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
+ 	}
+ 	args = append(args, "--state", "open", "--json", jsonFields)
+ 	cmd := h.cmd(ctx, "gh", args...)
+-	out, err := cmd.CombinedOutput()
++	out, detail, err := ghOutput(cmd)
+ 	if err != nil {
+-		return nil, fmt.Errorf("gh pr list: %s: %w", strings.TrimSpace(string(out)), err)
++		return nil, fmt.Errorf("gh pr list: %s: %w", detail, err)
+ 	}
+ 	var prs []struct {
+ 		Number              int    `json:"number"`
+@@ -249,9 +273,9 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
+ 	args = append(args, "--title", content.Title, "--body-file", "-")
+ 	cmd := h.cmd(ctx, "gh", args...)
+ 	cmd.Stdin = strings.NewReader(content.Body)
+-	out, err := cmd.CombinedOutput()
++	out, detail, err := ghOutput(cmd)
+ 	if err != nil {
+-		return nil, fmt.Errorf("gh pr create: %s: %w", strings.TrimSpace(string(out)), err)
++		return nil, fmt.Errorf("gh pr create: %s: %w", detail, err)
+ 	}
+ 	url := strings.TrimSpace(string(out))
+ 	pr := &scm.PR{URL: url}
+@@ -299,12 +323,12 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
+ 	args := append([]string{"pr", "checks", selector}, h.repoArgs()...)
+ 	args = append(args, "--json", "name,state,bucket,completedAt")
+ 	cmd := h.cmd(ctx, "gh", args...)
+-	out, err := cmd.CombinedOutput()
++	out, detail, err := ghOutput(cmd)
+ 	if err != nil {
+-		if strings.Contains(string(out), "no checks reported") {
++		if strings.Contains(detail, "no checks reported") {
+ 			return nil, nil
+ 		}
+-		return nil, fmt.Errorf("gh pr checks: %w", err)
++		return nil, fmt.Errorf("gh pr checks: %s: %w", detail, err)
+ 	}
+ 	var raw []struct {
+ 		Name        string `json:"name"`
+diff --git a/internal/scm/github/github_test.go b/internal/scm/github/github_test.go
+index 7fde33a..6635183 100644
+--- a/internal/scm/github/github_test.go
++++ b/internal/scm/github/github_test.go
+@@ -534,6 +534,100 @@ func TestAvailableFallsBackToUnscopedAuthWhenHostUnknown(t *testing.T) {
+ 	}
+ }
+ 
++// noiseOnStderr is what a wrapper around gh writes on every invocation. This
++// exact line comes from Automic Vault's gh build, but a corporate proxy or any
++// approval gate does the same thing. gh exits 0; the notice is an audit record,
++// not a refusal.
++const noiseOnStderr = "automic vault: human approval required\n"
++
++func TestGetChecksIgnoresWrapperNoiseOnStderr(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr checks 123 --repo test/repo --json name,state,bucket,completedAt": {
++			stdout: `[{"name":"build","state":"SUCCESS","bucket":"pass"}]` + "\n",
++			stderr: noiseOnStderr,
++		},
++	}), nil, "", "test/repo")
++
++	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
++	if err != nil {
++		t.Fatalf("GetChecks() error = %v, want stderr to be ignored", err)
++	}
++	if len(checks) != 1 || checks[0].Name != "build" {
++		t.Fatalf("checks = %+v, want single build check", checks)
++	}
++}
++
++func TestFindPRIgnoresWrapperNoiseOnStderr(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr list --head feature/refactor --base main --state open --json number,url": {
++			stdout: `[{"number":42,"url":"https://github.com/test/repo/pull/42"}]` + "\n",
++			stderr: noiseOnStderr,
++		},
++	}), nil, "", "")
++
++	pr, err := host.FindPR(context.Background(), "feature/refactor", "main")
++	if err != nil {
++		t.Fatalf("FindPR() error = %v", err)
++	}
++	// Folding stderr in does not error here — json.Unmarshal fails and FindPR
++	// reports "no PR". The pipeline then opens a second PR for a branch that
++	// already has one, which is why silence is the dangerous outcome.
++	if pr == nil {
++		t.Fatal("FindPR() = nil, want the existing PR found despite stderr noise")
++	}
++	if pr.Number != "42" {
++		t.Fatalf("FindPR() number = %q, want 42", pr.Number)
++	}
++}
++
++func TestCreatePRIgnoresWrapperNoiseOnStderr(t *testing.T) {
++	t.Parallel()
++
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr create --head feature/refactor --base main --repo test/repo --title t --body-file -": {
++			stdout:    "https://github.com/test/repo/pull/42\n",
++			stderr:    noiseOnStderr,
++			wantStdin: "b",
++		},
++	}), nil, "", "test/repo")
++
++	pr, err := host.CreatePR(context.Background(), "feature/refactor", "main", scm.PRContent{Title: "t", Body: "b"})
++	if err != nil {
++		t.Fatalf("CreatePR() error = %v", err)
++	}
++	// The URL is the output, so contamination lands straight in pr.URL and
++	// every later `gh pr view <url>` fails on a URL that was never valid.
++	if pr.URL != "https://github.com/test/repo/pull/42" {
++		t.Fatalf("CreatePR() URL = %q, want the URL alone", pr.URL)
++	}
++}
++
++func TestGetChecksStillReportsNoChecks(t *testing.T) {
++	t.Parallel()
++
++	// gh writes "no checks reported" to stderr and exits non-zero. Reading it
++	// off stdout only worked because the two streams were merged; the
++	// stderr-aware path has to keep this case working.
++	host := New(githubTestCmdFactory(map[string]githubTestResponse{
++		"gh pr checks 123 --repo test/repo --json name,state,bucket,completedAt": {
++			stderr: "no checks reported on the 'feature' branch\n",
++			code:   1,
++		},
++	}), nil, "", "test/repo")
++
++	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
++	if err != nil {
++		t.Fatalf("GetChecks() error = %v, want no-checks treated as empty", err)
++	}
++	if len(checks) != 0 {
++		t.Fatalf("checks = %+v, want none", checks)
++	}
++}
++
+ type githubTestResponse struct {
+ 	stdout    string
+ 	stderr    string

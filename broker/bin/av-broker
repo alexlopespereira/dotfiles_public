@@ -1,0 +1,1712 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""av-broker — cunhagem JIT de credenciais efêmeras no host.
+
+Fase 3 de docs/plano-adocao-tokens.md; política em docs/arquitetura-segredos.md
+§6.5. Cunha access token do GCP (≤1 h, impersonando SA de baixo privilégio) e
+do Salesforce (JWT Bearer, ADR §6.2).
+
+O alvo **github** saiu daqui em 18/ago/2026: a cunhagem efêmera do App foi
+trocada por dois PATs fine-grained de vida longa (`github-pat` no login
+keychain do Mac, `github-pat-vm` para o container/VM). A perda de segurança foi
+aceita explicitamente. Com ela saiu o subsistema de agente, que existia só para
+segurar a chave privada do App em RAM. GCP e Salesforce seguem no broker.
+
+ARQUIVO ÚNICO POR DESIGN: o Automic Vault atesta por hash de UM caminho
+(`av bless`). Um pacote multi-arquivo deixaria os módulos importados fora da
+atestação — a atestação valeria só para o entrypoint. Não quebre em módulos.
+
+Sem dependências fora da stdlib: assinatura RSA sai do `openssl`, o Keychain do
+`security`, e a chave privada nunca toca o disco (passa por pipe em /dev/fd).
+"""
+
+import argparse
+import base64
+import errno
+import hashlib
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+VERSION = "0.1.0"
+
+GCP_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GCP_IAMCREDENTIALS = "https://iamcredentials.googleapis.com/v1"
+GCP_CLOUD_PLATFORM = "https://www.googleapis.com/auth/cloud-platform"
+SF_TOKEN_PATH = "/services/oauth2/token"
+SF_JWT_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+# O Salesforce exige que o `exp` do JWT esteja numa janela curta a partir de
+# agora; 3 min é folgado o suficiente para tolerar deriva de relógio e curto o
+# suficiente para a asserção não ser reutilizável se for capturada.
+SF_ASSERTION_TTL = 180
+
+SESSION_TTL_CEILING = 8 * 3600  # ADR §6.5: teto de 8 h para a sessão de projeto
+GUI_TIMEOUT = 120  # s que o diálogo espera antes de negar. Falha fechada.
+
+# Resistência relativa dos portões (README "Portões de aprovação"). Serve para
+# recusar sessão aberta por portão mais fraco que o vigente agora.
+GATE_STRENGTH = {"tty": 1, "gui": 2, "touchid": 3}
+
+DEFAULT_CONFIG = {
+    # Sem bloco "github" desde 18/ago/2026: o alvo saiu do broker em favor de
+    # dois PATs fine-grained de vida longa (`github-pat` no Mac, `github-pat-vm`
+    # no container/VM). GCP e Salesforce continuam cunhados aqui.
+    "gcp": {
+        "broker_sa_email": None,
+        "key_provider": "env:GCP_BROKER_KEY",
+    },
+    # ADR §6.2. `read_only` é uma AFIRMAÇÃO SUA sobre o permission set, não algo
+    # que o broker consiga verificar — ver classify_salesforce().
+    "salesforce": {
+        "consumer_key": None,
+        "integration_user": None,
+        "login_url": "https://login.salesforce.com",
+        "key_provider": "env:SALESFORCE_KEY",
+        "read_only": False,
+    },
+    "policy": {
+        "session_ttl_seconds": SESSION_TTL_CEILING,
+        "touchid": True,
+    },
+    # Fase 4 (higiene contínua). Cadências do plano; dias em vez de cron porque
+    # o que importa é a IDADE da credencial, não o dia do calendário em que se
+    # lembrou dela.
+    "rotation": {
+        "gcp_days": 90,        # trimestral
+        "anthropic_days": 180, # semestral
+        "salesforce_days": 90, # trimestral
+    },
+    "paths": {"state_dir": "~/.local/state/av-broker"},
+}
+
+# Alvos de rotação: onde a credencial mora e qual chave de cadência a governa.
+# `verify` é o que impede rotação cega — trocar sem provar que a nova funciona
+# é como remover o velho antes de testar o novo.
+ROTATION_TARGETS = {
+    # `github` e `github-dev` saíram em 18/ago/2026 junto com o provedor: os PATs
+    # de vida longa moram no Keychain (`github-pat`, `github-pat-vm`) e são
+    # rotacionados na UI do GitHub, não por aqui.
+    "gcp": {
+        "keychain": "av-broker-gcp",
+        "days_key": "gcp_days",
+        "label": "chave da SA-broker do GCP",
+        "kind": "pem",
+    },
+    "anthropic": {
+        "keychain": "claude-setup-token",
+        "days_key": "anthropic_days",
+        "label": "claude setup-token",
+        "kind": "token",
+    },
+    "salesforce": {
+        "keychain": "av-broker-salesforce",
+        "days_key": "salesforce_days",
+        "label": "chave do JWT Bearer do Salesforce",
+        "kind": "pem",
+    },
+}
+
+
+# ---------------------------------------------------------------- utilidades
+
+class BrokerError(Exception):
+    """Erro esperado: sai com mensagem limpa, sem traceback."""
+
+
+def b64url(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def now():
+    return int(time.time())
+
+
+def iso(ts=None):
+    dt = datetime.fromtimestamp(ts if ts is not None else time.time(), timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def eprint(*a):
+    """Diagnóstico. Falhar ao IMPRIMIR nunca pode mudar o fluxo de controle.
+
+    A regra foi comprada caro em 02/ago/2026, quando um BrokenPipeError num
+    stderr morto cancelou um `return` em trânsito no agente (removido em
+    18/ago/2026) e produziu um daemon imortal. O engolir de OSError fica: um
+    print que falha não é motivo para mudar decisão nenhuma.
+    """
+    try:
+        print(*a, file=sys.stderr)
+    except OSError:
+        pass
+
+
+def deep_merge(base, over):
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path=None):
+    path = path or os.environ.get("AV_BROKER_CONFIG") or "~/.config/av-broker/config.json"
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return deep_merge(DEFAULT_CONFIG, {}), path
+    with open(path, "r") as fh:
+        try:
+            user = json.load(fh)
+        except ValueError as exc:
+            raise BrokerError("config inválido em %s: %s" % (path, exc))
+    return deep_merge(DEFAULT_CONFIG, user), path
+
+
+def state_dir(cfg):
+    d = os.path.expanduser(cfg["paths"]["state_dir"])
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+# ------------------------------------------------------- provedores de chave
+
+def _decode_base64_prefix(val, origem):
+    """Desfaz o prefixo `base64:` se presente; sem ele, devolve como veio.
+
+    Prefixo explícito, não heurística: adivinhar base64 erraria com qualquer
+    chave que por acaso se pareça. `origem` entra na mensagem de erro para que
+    "não decodifica" diga ONDE está o valor podre.
+    """
+    if not val.startswith("base64:"):
+        return val
+    try:
+        return base64.b64decode(val[7:], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BrokerError(
+            "%s tem prefixo 'base64:' mas não decodifica: %s" % (origem, exc))
+
+
+def read_key(provider):
+    """Devolve o PEM da chave privada. Formatos: env:VAR, keychain:SERVICE, file:PATH.
+
+    `env:` é o modo de produção: o script roda envelopado por
+    `av inject +CHAVE -- av-broker ...`, então o prompt do AV dispara e a chave
+    chega só no ambiente deste processo.
+
+    Sem memo: até 18/ago/2026 havia um `_KEY_MEMO` que só o agente ligava, para
+    reter a chave do GitHub App em RAM. Com o agente removido, o broker voltou a
+    ser processo de disparo único — lê a chave uma vez e morre, então cache aqui
+    não teria efeito e só reintroduziria chave privada retida sem necessidade.
+    """
+    if not provider or ":" not in provider:
+        raise BrokerError("key_provider inválido: %r (use env:/keychain:/file:)" % provider)
+    kind, ref = provider.split(":", 1)
+
+    if kind == "env":
+        val = os.environ.get(ref)
+        if not val:
+            raise BrokerError(
+                "variável %s vazia. Em produção rode envelopado:\n"
+                "  av inject +%s -- av-broker ..." % (ref, ref)
+            )
+        # Mesmo prefixo explícito do ramo keychain:, e pelo mesmo motivo — mas
+        # aqui ele é o PLANO B, não o caminho normal. O `av save` lê o valor de
+        # /dev/tty, e este repo já perdeu uma chave para um prompt que truncava
+        # multi-linha em silêncio (o -w do security, 128 chars, jul/2026). Se na
+        # migração o av save truncar o PEM, a saída é guardar base64 numa linha
+        # só — e sem este ramo o openssl receberia "base64:..." e falharia com
+        # um erro que não aponta a causa. Aceitar o prefixo aqui custa nada e
+        # transforma essa descoberta de uma sessão perdida em 30 segundos.
+        return _decode_base64_prefix(val, "variável %s" % ref)
+
+    if kind == "keychain":
+        service, _, account = ref.partition("/")
+        cmd = ["security", "find-generic-password", "-s", service, "-w"]
+        if account:
+            cmd[3:3] = ["-a", account]
+        p = subprocess.run(cmd, capture_output=True)
+        if p.returncode != 0:
+            raise BrokerError(
+                "Keychain: item %r não encontrado (exit %d). %s"
+                % (service, p.returncode, p.stderr.decode("utf-8", "replace").strip())
+            )
+        out = p.stdout.decode("utf-8").strip()
+        # `security -w` imprime o valor em HEX sempre que ele contém byte que a
+        # ferramenta não considera texto — e uma quebra de linha basta, então
+        # TODO PEM cai nesse caso. Sem esta conversão o openssl recebe
+        # "2d2d2d2d..." e falha com "Could not find private key".
+        # Vale para `keychain:av-broker-gcp` (o de produção do GCP) e para
+        # `keychain:av-broker-salesforce`.
+        if out and len(out) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in out):
+            try:
+                out = bytes.fromhex(out).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                pass  # não era hex de texto; devolve como veio
+        # Segredo multi-linha é gravado em base64 numa linha só, porque a única
+        # forma de o `security` receber o valor sem passá-lo em `argv` é pelo
+        # prompt — e o prompt lê UMA linha.
+        return _decode_base64_prefix(out, "item %r" % service)
+
+    if kind == "file":
+        eprint("⚠️  key_provider file: — SÓ para desenvolvimento. A chave está em disco.")
+        with open(os.path.expanduser(ref), "r") as fh:
+            return fh.read()
+
+    raise BrokerError("key_provider desconhecido: %r" % kind)
+
+
+def _dica_search_list():
+    """Se há chaveiro no disco fora da search list, "item ausente" é meia verdade.
+
+    A chave do App vive num chaveiro dedicado desde 02/ago/2026, e a search list
+    é preferência de usuário: não está no nix, não vem do repositório, e um
+    `security list-keychains -s` que esqueça um caminho a apaga. Depois de um
+    wipe, o sintoma é este — item "ausente" com o chaveiro intacto no disco, a
+    dois centímetros do processo que não o enxerga.
+    """
+    try:
+        p = subprocess.run(["security", "list-keychains", "-d", "user"],
+                           capture_output=True)
+        na_lista = set()
+        for linha in p.stdout.decode("utf-8", "replace").splitlines():
+            na_lista.add(os.path.realpath(linha.strip().strip('"')))
+        dir_kc = os.path.expanduser("~/Library/Keychains")
+        # `metadata.keychain-db` é do sistema (iCloud) e nunca entra na search
+        # list do usuário: citá-lo aqui seria ruído em cima de um aviso raro.
+        fora = sorted(f for f in os.listdir(dir_kc)
+                      if f.endswith(".keychain-db") and f != "metadata.keychain-db"
+                      and os.path.realpath(os.path.join(dir_kc, f)) not in na_lista)
+    except OSError:
+        return ""
+    if not fora:
+        return ""
+    return ("\n    Há chaveiro no disco FORA da search list: %s\n"
+            "    Se a chave está num deles, o broker não a enxerga. Reponha com:\n"
+            "      security list-keychains -d user -s ~/Library/Keychains/login.keychain-db \\\n"
+            "        ~/Library/Keychains/<o seu>.keychain-db" % ", ".join(fora))
+
+
+def key_present(provider):
+    """Confirma que a chave EXISTE sem ler o valor — e portanto sem diálogo.
+
+    A ACL do Keychain protege o dado, não o metadado: `find-generic-password`
+    SEM `-w` responde em ~0,02s mesmo num item criado com `-T ""`, enquanto ler
+    o valor abre diálogo de autorização (~4,7s medidos em 29/jul/2026). Isso é
+    o que permite ao `doctor` rodar sem custo de consentimento.
+
+    Devolve `(existe, motivo)`. Só afirma que o ponteiro aponta para algo — quem
+    valida o conteúdo é `doctor --deep`, e o rótulo do check diz isso em voz alta.
+    """
+    kind, _, ref = provider.partition(":")
+    if kind == "keychain":
+        service, _, account = ref.partition("/")
+        cmd = ["security", "find-generic-password", "-s", service]
+        if account:
+            cmd += ["-a", account]
+        p = subprocess.run(cmd, capture_output=True)
+        if p.returncode == 0:
+            return True, ""
+        return False, "item %r ausente do Keychain%s" % (service, _dica_search_list())
+    if kind == "file":
+        path = os.path.expanduser(ref)
+        return os.path.exists(path), "%s não existe" % path
+    # `env:` é filtrado pelo chamador (só tem valor sob `av inject`); qualquer
+    # outro prefixo é config errada, e errar fechado aqui é o certo.
+    return False, "key_provider desconhecido: %r" % provider
+
+
+def keychain_account(service):
+    """Descobre o `account` do item existente. Devolve None se o item não existe.
+
+    Adivinhar o `account` não dá erro — dá um item DUPLICADO. `add-generic-password
+    -U -s SERVICE -a OUTRO` não atualiza o item de `-a` diferente: cria um segundo
+    sob o mesmo serviço, com exit 0. E como `read_key()` busca só por serviço, o
+    Keychain passa a devolver um dos dois sem ordem garantida — ou seja, uma
+    rotação que se declara bem-sucedida e segue usando a chave velha, com a velha
+    ainda viva no Keychain. Era o defeito do `-a rotate` fixo, encontrado em
+    29/jul/2026 antes da primeira rotação real.
+
+    Só lê metadado, então não abre diálogo (a ACL protege o dado).
+    """
+    p = subprocess.run(["security", "find-generic-password", "-s", service],
+                       capture_output=True)
+    if p.returncode != 0:
+        return None
+    for linha in p.stdout.decode("utf-8", "replace").splitlines():
+        linha = linha.strip()
+        if not linha.startswith('"acct"<blob>='):
+            continue
+        resto = linha.split("=", 1)[1].strip()
+        # Duas formas possíveis: `"github"` e `0x6769... "github"` (o security
+        # imprime hex quando o valor tem byte que ele não considera texto).
+        if '"' in resto:
+            return resto[resto.index('"') + 1:resto.rindex('"')]
+        return resto
+    return None
+
+
+def keychain_file(service):
+    """Descobre em QUAL chaveiro o item vive. None se ele não existe.
+
+    Depois que a chave do App saiu do `login` para o `av-broker.keychain`
+    (02/ago/2026), "o chaveiro" deixou de ser óbvio — e a assimetria do
+    `security` é uma armadilha: `find-generic-password` acha o item por toda a
+    **search list**, mas `add-generic-password` SEM chaveiro posicional grava no
+    chaveiro **padrão**, que é o `login`. Uma rotação inocente apagaria o item do
+    chaveiro dedicado e recriaria a chave nova no `login`, onde o `partition_id`
+    aberto a deixa legível sem gesto nenhum: o endurecimento inteiro desfeito em
+    silêncio, com exit 0 e uma releitura que confere.
+    """
+    p = subprocess.run(["security", "find-generic-password", "-s", service],
+                       capture_output=True)
+    if p.returncode != 0:
+        return None
+    for linha in p.stdout.decode("utf-8", "replace").splitlines():
+        if linha.startswith("keychain:"):
+            return linha.split(":", 1)[1].strip().strip('"')
+    return None
+
+
+def keychain_write_hardened(service, account, valor, comentario, keychain=None):
+    """Grava sob (service, account) com ACL VAZIA, no MESMO chaveiro de origem.
+
+    `-T ""` **só vale na criação**. Um `-U` sobre item existente troca o valor e
+    preserva a ACL antiga, com exit 0 e sem aviso nenhum: medido em 29/jul/2026
+    tentando endurecer `av-broker-github` por `-U` — passou limpo e não mudou
+    nada. Daí o apagar-e-recriar; e daí a verificação de leitura no chamador, sem
+    a qual o conserto é indistinguível do não-conserto.
+
+    E `-T ""` sozinho **não basta**: no `login.keychain` ele não é cobrado,
+    porque o `partition_id` do item lá é aberto e o chaveiro fica destrancado a
+    vida toda. Medido em 02/ago/2026 — a mesma ACL, no chaveiro dedicado, abre
+    diálogo a cada leitura. Quem cobra o gesto é o par ACL vazia + chaveiro
+    próprio, e é por isso que `keychain` importa aqui.
+
+    O segredo entra por stdin (`security -i`), nunca em argv, e em base64 numa
+    linha só porque o modo `-i` lê o comando LINHA a linha — um PEM cru quebraria
+    em várias e só a primeira seria interpretada.
+    """
+    for nome, v in (("service", service), ("account", account),
+                    ("keychain", keychain or "")):
+        if '"' in v or "\n" in v:
+            raise BrokerError("%s inválido para o Keychain: %r" % (nome, v))
+    codificado = "base64:" + base64.b64encode(valor.encode("utf-8")).decode("ascii")
+    # Sem apagar, o -T "" abaixo seria ignorado em silêncio.
+    alvo = ["-s", service, "-a", account] + ([keychain] if keychain else [])
+    subprocess.run(["security", "delete-generic-password"] + alvo,
+                   capture_output=True)
+    comando = 'add-generic-password -s "%s" -a "%s" -T "" -j "%s" -w %s%s\n' % (
+        service, account, comentario, codificado,
+        ' "%s"' % keychain if keychain else "")
+    p = subprocess.run(["security", "-i"], input=comando.encode("utf-8"),
+                       capture_output=True)
+    if p.returncode != 0:
+        raise BrokerError(
+            "falhou ao gravar %r no Keychain: %s\n"
+            "⚠️  O item ANTERIOR já foi apagado. Regrave a chave à mão antes de\n"
+            "    qualquer outra coisa — ver broker/README.md."
+            % (service, p.stderr.decode("utf-8", "replace").strip()))
+
+
+def rs256_sign(message, pem):
+    """Assina com RSA-SHA256. A chave vai por pipe (/dev/fd), nunca por arquivo."""
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    if isinstance(pem, str):
+        pem = pem.encode("utf-8")
+
+    r, w = os.pipe()
+    try:
+        os.write(w, pem)
+    finally:
+        os.close(w)
+    try:
+        p = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", "/dev/fd/%d" % r],
+            input=message, capture_output=True, pass_fds=(r,),
+        )
+    finally:
+        try:
+            os.close(r)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+    if p.returncode != 0:
+        raise BrokerError(
+            "openssl falhou ao assinar: %s" % p.stderr.decode("utf-8", "replace").strip()
+        )
+    return p.stdout
+
+
+def make_jwt(claims, pem, header=None):
+    hdr = {"alg": "RS256", "typ": "JWT"}
+    hdr.update(header or {})
+    signing_input = "%s.%s" % (
+        b64url(json.dumps(hdr, separators=(",", ":"))),
+        b64url(json.dumps(claims, separators=(",", ":"))),
+    )
+    return "%s.%s" % (signing_input, b64url(rs256_sign(signing_input, pem)))
+
+
+# ------------------------------------------------------------------- rede
+
+def http(method, url, headers=None, body=None, form=False):
+    data = None
+    headers = dict(headers or {})
+    if body is not None:
+        if form:
+            data = urllib.parse.urlencode(body).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+    headers.setdefault("User-Agent", "av-broker/%s" % VERSION)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        raise BrokerError("HTTP %s em %s: %s" % (exc.code, url, detail))
+    except urllib.error.URLError as exc:
+        raise BrokerError("falha de rede em %s: %s" % (url, exc.reason))
+    return json.loads(raw) if raw else {}
+
+
+# ---------------------------------------------------------------- política
+
+def classify_gcp(scopes):
+    """Heurística honesta: só é read-only se TODO escopo terminar em .readonly/.read_only.
+
+    Escopos do GCP são grossos — `cloud-platform` cobre escrita, então cai em
+    write e prompta sempre. É conservador de propósito.
+    """
+    for scope in scopes:
+        s = scope.lower()
+        if not (s.endswith(".readonly") or s.endswith(".read_only")):
+            return "write"
+    return "read"
+
+
+def classify_salesforce(sf):
+    """No Salesforce o broker NÃO consegue classificar sozinho — e isso é do protocolo.
+
+    O grant JWT Bearer não aceita escopos na cunhagem (ADR §6.2): o poder do
+    token vem do permission set do usuário de integração e da política de
+    Permitted Users do app. Nada disso é visível na resposta do `/token`, então
+    inspecionar o token não diz se ele é de leitura.
+
+    Default: **write** — prompta sempre. É a única postura honesta quando não se
+    sabe o que a credencial pode fazer.
+
+    `read_only: true` no config é uma AFIRMAÇÃO SUA de que verificou o permission
+    set. Fica no config de propósito, e NÃO existe como flag de linha de comando:
+    uma flag permitiria que um agente comprometido rebaixasse a classificação
+    para escapar do portão, que é precisamente o que o portão existe para impedir.
+    O config é revisável, versionável e muda com gesto seu.
+    """
+    return "read" if sf.get("read_only") is True else "write"
+
+
+def salesforce_targets(cfg):
+    """Todos os alvos de Salesforce configurados, como {nome: bloco}.
+
+    Duas formas aceitas, porque a antiga já está em uso e quebrar config de
+    quem já ligou a sandbox seria custo sem retorno:
+
+      "salesforce": {"consumer_key": …}                    → um alvo, "default"
+      "salesforce": {"targets": {"prod": {…}, "sbx": {…}}}  → vários
+
+    Na segunda forma, chaves do bloco-pai valem como default para todos os
+    alvos (útil para `read_only`), e o alvo sobrescreve o que repetir.
+    """
+    sf = cfg.get("salesforce") or {}
+    alvos = sf.get("targets")
+    if not alvos:
+        return {"default": sf} if sf.get("consumer_key") else {}
+    herdado = {k: v for k, v in sf.items()
+               if k not in ("targets", "default_target") and not k.startswith("_")}
+    saida = {}
+    for nome, bloco in alvos.items():
+        if nome.startswith("_"):
+            continue
+        combinado = dict(herdado)
+        combinado.update(bloco or {})
+        saida[nome] = combinado
+    return saida
+
+
+def salesforce_target(cfg, nome=None):
+    """Resolve UM alvo. Devolve (nome, bloco).
+
+    Sem `--target` e com mais de um alvo, ERRA em vez de escolher: adivinhar
+    qual org o chamador queria é o tipo de default que produz cunhagem em
+    produção quando alguém queria sandbox.
+    """
+    alvos = salesforce_targets(cfg)
+    if not alvos:
+        raise BrokerError(
+            "nenhum alvo de Salesforce configurado. Ver o runbook privado de Salesforce §6.")
+    if nome is None:
+        nome = (cfg.get("salesforce") or {}).get("default_target")
+    if nome is None:
+        if len(alvos) == 1:
+            nome = next(iter(alvos))
+        else:
+            raise BrokerError(
+                "há %d alvos de Salesforce (%s) e nenhum default — diga qual:\n"
+                "  av-broker salesforce --target %s"
+                % (len(alvos), ", ".join(sorted(alvos)), sorted(alvos)[0]))
+    if nome not in alvos:
+        raise BrokerError("alvo de Salesforce %r não existe. Há: %s"
+                          % (nome, ", ".join(sorted(alvos))))
+    return nome, alvos[nome]
+
+
+def grants_path(cfg):
+    return os.path.join(state_dir(cfg), "grants.json")
+
+
+def load_grants(cfg):
+    path = grants_path(cfg)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except (ValueError, OSError):
+        return {}
+
+
+def save_grants(cfg, grants):
+    path = grants_path(cfg)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(grants, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def grant_key(provider, project):
+    return "%s:%s" % (provider, project)
+
+
+def credential_fingerprint(cfg, provider):
+    """Identidade da credencial-mãe, para que trocá-la derrube a sessão aberta.
+
+    Inclui o material da chave quando lê-lo é barato. Só a config não bastava:
+    em 29/jul/2026 a chave do App foi trocada por uma nova e a cunhagem seguinte
+    saiu `silent` — app_id e key_provider não haviam mudado, então a aprovação
+    dada à chave ANTIGA silenciou a primeira cunhagem da chave NOVA. Rotação é
+    exatamente quando o humano deve ser perguntado de novo.
+
+    `env:` fica de fora do hash do material de propósito: ali a chave só existe
+    dentro do envelope do `av inject`, e lê-la a cada cunhagem dispararia o
+    prompt do AV — o oposto do objetivo. Nesse modo, trocar a chave sem trocar a
+    config não invalida a sessão; o TTL é que limita a janela.
+
+    Só o hash entra no grant. O grants.json é 0600, mas um fingerprint não é
+    lugar para material de chave nem em arquivo protegido.
+    """
+    sec = cfg.get(provider) or {}
+    parts = [
+        provider,
+        str(sec.get("app_id") or sec.get("broker_sa_email") or ""),
+        str(sec.get("key_provider") or ""),
+    ]
+    ref = sec.get("key_provider") or ""
+    if ref and not ref.startswith("env:"):
+        try:
+            parts.append(hashlib.sha256(read_key(ref).encode("utf-8")).hexdigest())
+        except BrokerError:
+            # Chave ilegível não é decidido aqui — a cunhagem falha logo adiante
+            # com a mensagem certa. Marcar o estado mantém a sessão da chave
+            # sadia separada de qualquer sessão nascida com ela quebrada.
+            parts.append("ilegivel")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def session_valid(cfg, provider, project, target, args=None):
+    """Uma sessão só silencia o que o humano de fato consentiu.
+
+    Cada checagem existe porque a sua ausência já produziu — ou produziria — um
+    consentimento que não corresponde ao que aconteceu:
+
+    - `target`: nomes de repo colidem entre donos; aprovar `voce/dotfiles` não
+      pode silenciar `outro/dotfiles`.
+    - `dry_run`: aprovar um ensaio que não chama API nenhuma não pode autorizar
+      cunhagem real. Medido em 29/jul/2026 — um grant de `--dry-run` feito com
+      chave descartável silenciou a primeira cunhagem real do App real.
+    - `cred`: trocar de App/SA ou de origem da chave muda o que o token alcança;
+      o consentimento anterior era sobre outra credencial.
+    - `gate`: sessão aberta por portão mais fraco que o vigente não silencia. Um
+      `tty` — que não resiste a quem controla o stdio — não herda a autoridade
+      do diálogo do macOS.
+    """
+    g = load_grants(cfg).get(grant_key(provider, project))
+    if not g or g.get("expires_at", 0) <= now():
+        return False
+    if g.get("target") != target:
+        return False
+    if bool(g.get("dry_run")) and not getattr(args, "dry_run", False):
+        return False
+    if g.get("cred") != credential_fingerprint(cfg, provider):
+        return False
+    if GATE_STRENGTH.get(g.get("gate"), 0) < GATE_STRENGTH.get(resolve_gate(cfg), 0):
+        return False
+    return True
+
+
+def record_grant(cfg, provider, project, target, how, args=None):
+    ttl = min(int(cfg["policy"]["session_ttl_seconds"]), SESSION_TTL_CEILING)
+    grants = load_grants(cfg)
+    grants[grant_key(provider, project)] = {
+        "granted_at": now(),
+        "expires_at": now() + ttl,
+        "granted_at_iso": iso(),
+        "target": target,
+        "gate": how,
+        "dry_run": bool(getattr(args, "dry_run", False)),
+        "cred": credential_fingerprint(cfg, provider),
+    }
+    save_grants(cfg, grants)
+    return ttl
+
+
+# --------------------------------------------------------------- aprovação
+
+# realpath, não abspath: a instalação recomendada é um symlink em ~/.local/bin,
+# e abspath NÃO resolve symlinks — procuraria o .swift ao lado do link, não do
+# fonte, e o Touch ID cairia silenciosamente no desafio digitado.
+TOUCHID_SWIFT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "touchid-gate.swift")
+
+
+def touchid_binary(cfg):
+    """Compila o helper de Touch ID sob demanda; recompila se a fonte mudar."""
+    if not os.path.exists(TOUCHID_SWIFT) or not os.path.exists("/usr/bin/swiftc"):
+        return None
+    with open(TOUCHID_SWIFT, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+    out = os.path.join(state_dir(cfg), "touchid-gate-%s" % digest)
+    if not os.path.exists(out):
+        p = subprocess.run(
+            ["/usr/bin/swiftc", "-O", "-o", out, TOUCHID_SWIFT], capture_output=True
+        )
+        if p.returncode != 0:
+            eprint("aviso: não compilou o gate de Touch ID: %s"
+                   % p.stderr.decode("utf-8", "replace").strip()[:200])
+            return None
+        os.chmod(out, 0o700)
+    return out
+
+
+WORDS = ["ancora", "brasa", "cedro", "duna", "eixo", "fresta",
+         "gume", "hausto", "ilha", "junco", "lastro", "manto",
+         "nervura", "olmo", "prumo", "quilha", "resina", "sarça",
+         "tordo", "urze", "vigia", "xisto", "zimbro", "aljava"]
+
+
+def touchid_available(cfg):
+    """Sonda a biometria SEM mostrar diálogo (--probe)."""
+    binary = touchid_binary(cfg)
+    if not binary:
+        return False
+    return subprocess.run([binary, "--probe"], capture_output=True).returncode == 0
+
+
+def gui_available():
+    """Há sessão gráfica (Aqua) para receber um diálogo nativo?"""
+    if os.environ.get("SSH_CONNECTION"):
+        return False
+    try:
+        p = subprocess.run(["launchctl", "managername"], capture_output=True, timeout=5)
+        return p.stdout.decode("utf-8", "replace").strip() == "Aqua"
+    except Exception:
+        return False
+
+
+def resolve_gate(cfg):
+    """Escolhe o portão. 'auto' pega o mais forte disponível, na ordem:
+
+    touchid → gui → tty. A ordem é por resistência a um chamador hostil, não
+    por conveniência: ver a tabela no broker/README.md.
+    """
+    want = os.environ.get("AV_BROKER_GATE") or cfg["policy"].get("gate", "auto")
+    if want != "auto":
+        return want
+    if touchid_available(cfg):
+        return "touchid"
+    if gui_available():
+        return "gui"
+    return "tty"
+
+
+def _as_str(s):
+    """Literal de string para AppleScript."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def gui_challenge(summary, word):
+    """Diálogo nativo do macOS pedindo a palavra.
+
+    É o portão preferido nesta máquina (sem biometria) porque é *out-of-band*
+    em relação ao stdio: um processo que capturou os pipes — ou até o pty — do
+    broker não lê a palavra nem responde por ele. Dirigir o diálogo por
+    software exige permissão de Acessibilidade (TCC), que o checklist recusa.
+
+    `default button "Aprovar"`: Enter envia o que estiver no campo. Isso NÃO
+    afrouxa o portão, porque o portão nunca foi o botão — é o `typed == word`
+    lá embaixo. Enter com o campo vazio devolve `palavra-errada`, que o
+    chamador trata como negado e sem retry: uma tentativa, falha fechada. O
+    default anterior era "Negar", e o custo dele era real — o botão azul à
+    esquerda contradizia o layout do macOS e se lia como "aprovar", enquanto
+    quem digitava a palavra e apertava Enter (o gesto óbvio) era negado sem
+    entender por quê.
+    """
+    body = "\n".join(summary) + "\n\nDigite a palavra para aprovar:  %s" % word
+    script = (
+        "display dialog %s with title %s default answer \"\" "
+        "buttons {\"Negar\", \"Aprovar\"} default button \"Aprovar\" "
+        "with icon caution giving up after %d"
+        % (_as_str(body), _as_str("av-broker — aprovação de credencial"),
+           GUI_TIMEOUT)
+    )
+    p = subprocess.run(["osascript", "-e", script], capture_output=True)
+    if p.returncode != 0:      # cancelou com Esc / fechou a janela
+        return "cancelado"
+    out = p.stdout.decode("utf-8", "replace")
+    if "gave up:true" in out:
+        return "expirou"
+    if "button returned:Aprovar" not in out:
+        return "negado"
+    typed = out.split("text returned:", 1)[-1].split(",")[0].strip() \
+        if "text returned:" in out else ""
+    return "ok" if typed == word else "palavra-errada"
+
+
+def tty_challenge(word):
+    """Desafio digitado no terminal — o portão mais fraco, usado sem GUI.
+
+    NÃO resiste a um chamador que controle o stdio do broker: quem lê a
+    palavra pode digitá-la de volta. Está aqui para sessões sem sessão
+    gráfica (SSH), não como controle de escolha.
+    """
+    if not sys.stdin.isatty():
+        eprint("erro: sem TTY — não há como obter aprovação humana.")
+        return False
+    try:
+        answer = input("Digite %r para aprovar (qualquer outra coisa nega): " % word)
+    except (EOFError, KeyboardInterrupt):
+        eprint()
+        return False
+    return answer.strip() == word
+
+
+def prompt_approval(cfg, summary, reason):
+    """Portão humano.
+
+    A palavra muda a cada prompt de propósito: Anderson et al. (CHI 2015)
+    mediram, por fMRI, queda de processamento visual já na 2ª exposição a um
+    aviso idêntico, e mostraram que avisos polimórficos resistem. Um [s/N]
+    fixo vira reflexo; uma palavra que muda exige ler.
+    """
+    box = "─" * 64
+    eprint("\n┌%s┐" % box)
+    for line in summary:
+        eprint("│ %-62s │" % line[:62])
+    eprint("└%s┘" % box)
+
+    kind = resolve_gate(cfg)
+    word = random.choice(WORDS)
+
+    if kind == "touchid":
+        binary = touchid_binary(cfg)
+        rc = subprocess.run([binary, reason]).returncode if binary else 2
+        if rc == 0:
+            return "touchid"
+        if rc == 1:
+            return None
+        kind = "gui" if gui_available() else "tty"
+        eprint("aviso: biometria falhou agora — usando o portão %s." % kind)
+
+    if kind == "gui":
+        status = gui_challenge(summary, word)
+        if status == "ok":
+            return "gui"
+        eprint({
+            "expirou": "diálogo expirou em %ds sem resposta — negado (falha fechada)."
+                       % GUI_TIMEOUT,
+            "palavra-errada": "palavra digitada não confere — negado.",
+            "cancelado": "diálogo cancelado — negado.",
+        }.get(status, "negado."))
+        return None
+
+    return "tty" if tty_challenge(word) else None
+
+
+# ------------------------------------------------------------------ auditoria
+
+def requester():
+    """Quem pediu: pid, caminho e sha256 do binário-pai. Best-effort.
+
+    Voltou a ser sempre o pai direto em 18/ago/2026, com a saída do agente: não
+    há mais socket no meio, então o pai É o chamador e o `via: agent` do JSONL
+    deixou de existir. Linhas antigas do log ainda o carregam.
+    """
+    info = {"pid": os.getppid()}
+    try:
+        p = subprocess.run(["ps", "-o", "comm=", "-p", str(info["pid"])],
+                           capture_output=True, timeout=5)
+        path = p.stdout.decode("utf-8", "replace").strip()
+        if path:
+            info["path"] = path
+            if os.path.isfile(path):
+                h = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        h.update(chunk)
+                info["sha256"] = h.hexdigest()
+    except Exception:
+        pass
+    return info
+
+
+def audit(cfg, record):
+    """Append-only JSONL. É o substituto do audit log do GitHub (Enterprise-only)."""
+    path = os.path.join(state_dir(cfg), "mints.jsonl")
+    record = dict(record)
+    record.setdefault("ts", iso())
+    record.setdefault("version", VERSION)
+    record.setdefault("requester", requester())
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def gate(cfg, base, summary, reason, args):
+    """Aplica a política do ADR §6.5 e devolve como a aprovação foi obtida.
+
+    write  → prompta SEMPRE (nunca silencioso, nunca cacheado)
+    read   → silencioso se a sessão do projeto está viva; senão prompta e abre sessão
+
+    Levanta BrokerError se não houver aprovação — e audita a recusa antes, porque
+    "algo tentou cunhar e não passou" é justamente o que o log precisa mostrar.
+    """
+    provider, project = base["provider"], base["project"]
+    klass, target = base["classification"], base["target"]
+
+    if klass == "read" and session_valid(cfg, provider, project, target, args):
+        return "silent"
+
+    if args.no_prompt:
+        audit(cfg, dict(base, approval="refused", result="no-prompt"))
+        raise BrokerError(
+            "aprovação necessária (classe %s) e --no-prompt está ativo." % klass
+        )
+
+    how = prompt_approval(cfg, summary, reason)
+    if how is None:
+        audit(cfg, dict(base, approval="denied", result="denied"))
+        raise BrokerError("aprovação negada.")
+
+    # Só permissão de leitura abre sessão. Aprovar um write NÃO silencia os
+    # próximos writes — é exatamente o ponto do gate.
+    if klass == "read":
+        record_grant(cfg, provider, project, target, how, args)
+    return how
+
+
+# ---------------------------------------------- GitHub e agente: removidos
+#
+# Em 18/ago/2026 o alvo `github` saiu do broker. A cunhagem JIT do App (JWT
+# RS256 -> token de instalacao de 1 h) foi trocada por dois PATs fine-grained de
+# vida longa: `github-pat` no login keychain do Mac e `github-pat-vm` para o
+# container/VM. A perda de seguranca — segredo de vida longa em vez de efemero,
+# sem portao por cunhagem — foi aceita explicitamente pelo dono do repo.
+#
+# Com o github saiu o subsistema de agente inteiro (socket unix, `--lazy-key`,
+# `agent start|stop|status`): ele existia apenas para segurar a chave privada do
+# App em RAM e economizar o dialogo do Keychain a cada cunhagem — `_agent_handle`
+# so conhecia `op == "mint"` de github. Sem github nao ha o que ele resolva, e
+# manter chave privada retida em RAM sem beneficio seria so o custo.
+#
+# GCP e Salesforce seguem cunhados aqui, com o mesmo portao e a mesma auditoria.
+
+
+# ----------------------------------------------------------------------- GCP
+
+GCP_SA_SUFFIX = ".iam.gserviceaccount.com"
+
+
+def gcp_project_from_sa(email):
+    """PROJECT_ID a partir de NOME@PROJECT_ID.iam.gserviceaccount.com.
+
+    O `split("@")[0]` que estava aqui devolvia o NOME da SA: em 29/jul/2026 o
+    diálogo dizia "projeto: av-agent" para
+    av-agent@projeto-broker.iam.gserviceaccount.com. Pedir consentimento
+    exibindo o projeto errado é o defeito que este broker existe para não ter — e
+    o log JSONL gravava o mesmo valor errado, contaminando a trilha forense.
+
+    Devolve None para as SAs geridas pelo Google (`appspot`, `developer`), onde o
+    projeto não fica nesta posição. Adivinhar ali reintroduziria o mesmo bug com
+    outra cara; quem impersonar uma dessas passa `--project` explícito.
+    """
+    domain = email.partition("@")[2]
+    if domain.endswith(GCP_SA_SUFFIX):
+        return domain[: -len(GCP_SA_SUFFIX)] or None
+    return None
+
+
+def cmd_gcp(cfg, args):
+    g = cfg["gcp"]
+    scopes = args.scope or [GCP_CLOUD_PLATFORM]
+    lifetime = min(int(args.lifetime), 3600)
+    project = args.project or gcp_project_from_sa(args.target_sa)
+    if not project:
+        raise BrokerError(
+            "não deduzi o projeto de %r (só reconheço %s). Passe --project."
+            % (args.target_sa, GCP_SA_SUFFIX))
+    klass = classify_gcp(scopes)
+
+    summary = [
+        "GCP — access token por impersonation (expira em %ds)" % lifetime,
+        "",
+        "SA alvo:   %s" % args.target_sa[:52],
+        "escopos:   %d (%s)" % (len(scopes), scopes[0].rsplit("/", 1)[-1]),
+        "classe:    %s" % ("ESCRITA — aprovação obrigatória" if klass == "write"
+                           else "leitura"),
+        "projeto:   %s" % project,
+    ]
+    reason = "cunhar token do GCP impersonando %s" % args.target_sa
+
+    base = {"provider": "gcp", "project": project, "target": args.target_sa,
+            "scopes": scopes, "classification": klass, "ttl_seconds": lifetime}
+    if args.dry_run:
+        base["dry_run"] = True
+
+    if not args.dry_run and not g.get("broker_sa_email"):
+        raise BrokerError("gcp.broker_sa_email não configurado (rode broker/gcp/setup-sa-broker.sh)")
+
+    how = gate(cfg, base, summary, reason, args)
+
+    if args.dry_run:
+        audit(cfg, dict(base, approval=how, result="dry-run"))
+        emit(args, {"dry_run": True, "would_impersonate": args.target_sa,
+                    "scopes": scopes, "lifetime": "%ds" % lifetime})
+        return 0
+
+    try:
+        pem = read_key(g["key_provider"])
+        assertion = make_jwt({
+            "iss": g["broker_sa_email"], "sub": g["broker_sa_email"],
+            "aud": GCP_TOKEN_URI, "scope": GCP_CLOUD_PLATFORM,
+            "iat": now() - 60, "exp": now() + 3600,
+        }, pem)
+        broker_tok = http("POST", GCP_TOKEN_URI, form=True, body={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": assertion,
+        })
+        minted = http(
+            "POST",
+            "%s/projects/-/serviceAccounts/%s:generateAccessToken"
+            % (GCP_IAMCREDENTIALS, args.target_sa),
+            headers={"Authorization": "Bearer %s" % broker_tok["access_token"]},
+            body={"scope": scopes, "lifetime": "%ds" % lifetime},
+        )
+    except BrokerError as exc:
+        audit(cfg, dict(base, approval=how, result="error", error=str(exc)[:300]))
+        raise
+
+    audit(cfg, dict(base, approval=how, result="ok",
+                    expires_at=minted.get("expireTime")))
+    emit(args, {"token": minted["accessToken"], "expires_at": minted.get("expireTime"),
+                "target_sa": args.target_sa, "scopes": scopes})
+    return 0
+
+
+# --------------------------------------------------------------- Salesforce
+
+def cmd_salesforce(cfg, args):
+    """JWT Bearer (RFC 7523) → access token + instance_url. ADR §6.2.
+
+    Diferenças em relação ao gcp que estão no protocolo, não na implementação:
+      - não há escopo na cunhagem (ver classify_salesforce);
+      - a resposta NÃO traz `expires_in` (~2 h típico, não garantido), então o
+        sinal autoritativo de token morto é 401 no uso, não um relógio nosso;
+      - não há refresh token — e isso é desejável: nada de vida longa cruza a
+        fronteira host→VM, o broker re-cunha sob demanda.
+    """
+    alvo, sf = salesforce_target(cfg, getattr(args, "target", None))
+    login = str(sf.get("login_url") or "https://login.salesforce.com").rstrip("/")
+    klass = classify_salesforce(sf)
+    usuario = sf.get("integration_user") or "<não configurado>"
+
+    faltando = [k for k in ("consumer_key", "integration_user", "key_provider")
+                if not sf.get(k)]
+    if faltando and not args.dry_run:
+        raise BrokerError(
+            "salesforce.%s não configurado no alvo %r. Ver o runbook privado de Salesforce §6."
+            % (", salesforce.".join(faltando), alvo))
+
+    # O ambiente vai na PRIMEIRA linha do resumo porque é a única diferença que
+    # importa entre dois diálogos por outro lado idênticos — e ler "produção"
+    # depois de "usuário" é ler tarde demais.
+    producao = ".sandbox." not in login and "test.salesforce.com" not in login
+    summary = [
+        "Salesforce — access token por JWT Bearer",
+        "",
+        "ORG:       %s  %s" % (alvo, "⚠️  PRODUÇÃO" if producao else "(sandbox)"),
+        "usuário:   %s" % usuario[:52],
+        "login URL: %s" % login,
+        "classe:    %s" % ("ESCRITA — aprovação obrigatória" if klass == "write"
+                           else "leitura (afirmada no config)"),
+        "escopo:    definido pelo permission set, NÃO por este token",
+    ]
+    reason = "cunhar access token do Salesforce (%s) como %s" % (alvo, usuario)
+
+    # `project` é o usuário de integração: é ele que delimita o que o token pode
+    # fazer, então é a unidade de sessão que faz sentido — aprovar um usuário não
+    # pode silenciar a cunhagem para outro. Com dois alvos isso segue correto:
+    # orgs distintas têm usuários distintos, então a sessão não vaza entre elas
+    # nem quando `read_only` está ligado.
+    base = {"provider": "salesforce", "project": usuario, "target": login,
+            "org": alvo, "classification": klass}
+    if args.dry_run:
+        base["dry_run"] = True
+
+    how = gate(cfg, base, summary, reason, args)
+
+    if args.dry_run:
+        audit(cfg, dict(base, approval=how, result="dry-run"))
+        emit(args, {"dry_run": True, "would_authenticate_as": usuario,
+                    "login_url": login, "classification": klass})
+        return 0
+
+    try:
+        pem = read_key(sf["key_provider"])
+        assertion = make_jwt({
+            "iss": sf["consumer_key"],
+            "sub": sf["integration_user"],
+            "aud": login,
+            "exp": now() + SF_ASSERTION_TTL,
+        }, pem)
+        minted = http("POST", login + SF_TOKEN_PATH, form=True, body={
+            "grant_type": SF_JWT_GRANT, "assertion": assertion,
+        })
+    except BrokerError as exc:
+        audit(cfg, dict(base, approval=how, result="error", error=str(exc)[:300]))
+        # `invalid_grant` é o erro mais comum deste fluxo e a mensagem crua do
+        # Salesforce não diz qual das cinco causas foi. Enumerar aqui poupa a
+        # tarde que se perde adivinhando.
+        if "invalid_grant" in str(exc):
+            raise BrokerError(
+                "%s\n\ninvalid_grant tem cinco causas comuns, em ordem de frequência:\n"
+                "  1. login_url errado — sandbox usa https://test.salesforce.com\n"
+                "  2. o usuário não está pré-autorizado no app (Permitted Users:\n"
+                "     'Admin approved users are pre-authorized' + permission set)\n"
+                "  3. o certificado no app não corresponde a esta chave privada\n"
+                "  4. consumer_key de outro app\n"
+                "  5. integration_user com username errado (é o username, não o e-mail\n"
+                "     de contato, quando diferem)" % exc)
+        raise
+
+    token = minted.get("access_token")
+    if not token:
+        audit(cfg, dict(base, approval=how, result="error",
+                        error="resposta sem access_token"))
+        raise BrokerError("o Salesforce respondeu sem access_token: %r" % minted)
+
+    # Sem expires_at no log de propósito: inventar um valor que o Salesforce não
+    # garantiu seria pior que registrar a ausência.
+    audit(cfg, dict(base, approval=how, result="ok",
+                    instance_url=minted.get("instance_url"),
+                    expires_at=None))
+    emit(args, {"token": token,
+                "instance_url": minted.get("instance_url"),
+                "integration_user": usuario,
+                "expires_at": None})
+    return 0
+
+
+# ------------------------------------------------------------------- saída
+
+def emit(args, payload):
+    """Saída do token. TRANSPORTE PLUGÁVEL (cuidado 2 do plano).
+
+    Hoje: stdout cru ou JSON. A entrega à VM (placeholder/vsock do shuru) entra
+    como um novo modo aqui quando a Fase 2 aprovar o egress — nada mais do
+    broker muda. O broker NUNCA escreve o token em disco.
+
+    A frase acima voltou a valer ponta a ponta em 18/ago/2026, e vale registrar
+    por que esteve suspensa: entre 02 e 18/ago o `scripts/gh-broker.sh` cacheava
+    em disco (0600, ~/.local/state/av-broker/gh-cache) os tokens de **leitura**
+    do GitHub, por 45 min, porque sem isso cada `gh` abria um diálogo de senha do
+    Keychain. Esse wrapper e esse cache saíram junto com o alvo `github`. Nenhum
+    consumidor dos alvos restantes (gcp, salesforce) escreve token em disco.
+    """
+    if args.emit == "json":
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return
+    token = payload.get("token")
+    if token is None:
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return
+    if sys.stdout.isatty():
+        eprint("⚠️  token indo para um TTY — ele fica no scrollback. Prefira um pipe.")
+    sys.stdout.write(token + "\n")
+
+
+# ---------------------------------------------------------------- subcomandos
+
+def cmd_session(cfg, args):
+    grants = load_grants(cfg)
+    if args.session_action == "list":
+        if not grants:
+            print("nenhuma sessão ativa.")
+            return 0
+        for key, g in sorted(grants.items()):
+            left = g.get("expires_at", 0) - now()
+            status = "%dm restantes" % (left // 60) if left > 0 else "EXPIRADA"
+            print("%-40s %s" % (key, status))
+        return 0
+    if args.session_action == "revoke":
+        if args.all:
+            save_grants(cfg, {})
+            audit(cfg, {"provider": "-", "event": "session_revoke_all", "result": "ok"})
+            print("todas as sessões revogadas.")
+            return 0
+        if not args.project:
+            raise BrokerError("informe --project ou --all")
+        removed = [k for k in grants if k.endswith(":%s" % args.project)]
+        for k in removed:
+            del grants[k]
+        save_grants(cfg, grants)
+        audit(cfg, {"provider": "-", "event": "session_revoke",
+                    "project": args.project, "removed": removed, "result": "ok"})
+        print("revogadas: %s" % (", ".join(removed) or "nenhuma"))
+        return 0
+    return 1
+
+
+def cmd_log(cfg, args):
+    path = os.path.join(state_dir(cfg), "mints.jsonl")
+    if not os.path.exists(path):
+        print("sem log ainda: %s" % path)
+        return 0
+    with open(path, "r") as fh:
+        lines = fh.readlines()
+    for line in lines[-args.n:]:
+        if args.raw:
+            sys.stdout.write(line)
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        print("%s  %-7s %-10s %-28s %-6s %s" % (
+            r.get("ts", "?"), r.get("provider", "?"),
+            r.get("classification", r.get("event", "-")),
+            str(r.get("target", "-"))[:28],
+            r.get("approval", "-"), r.get("result", "-")))
+    return 0
+
+
+# ------------------------------------------------- Fase 4: higiene contínua
+
+def key_fingerprint(pem):
+    """SHA-256 da chave PÚBLICA derivada do PEM.
+
+    É o que permite o log dizer *qual* chave passou a valer sem jamais registrar
+    material secreto — e é como se confere, depois, que a chave em uso é mesmo a
+    que se cunhou na UI do provedor.
+    """
+    if isinstance(pem, str):
+        pem = pem.encode("utf-8")
+    r, w = os.pipe()
+    try:
+        os.write(w, pem)
+    finally:
+        os.close(w)
+    try:
+        p = subprocess.run(["openssl", "pkey", "-pubout", "-in", "/dev/fd/%d" % r],
+                           capture_output=True, pass_fds=(r,))
+    finally:
+        try:
+            os.close(r)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+    if p.returncode != 0:
+        raise BrokerError("não parece uma chave privada válida: %s"
+                          % p.stderr.decode("utf-8", "replace").strip()[:200])
+    return "sha256:" + hashlib.sha256(p.stdout).hexdigest()[:32]
+
+
+def keychain_created(service):
+    """Epoch de criação do item, ou None. Fallback de idade quando não há log."""
+    p = subprocess.run(["security", "find-generic-password", "-s", service],
+                       capture_output=True)
+    if p.returncode != 0:
+        return None
+    for line in p.stdout.decode("utf-8", "replace").splitlines():
+        if '"cdat"' not in line:
+            continue
+        # Formato: "cdat"<timedate>=0x3230... "20260729120000Z\000"
+        parte = line.split('"')
+        for chunk in parte:
+            chunk = chunk.strip().rstrip("\\000").rstrip("Z")
+            if len(chunk) == 14 and chunk.isdigit():
+                try:
+                    dt = datetime.strptime(chunk, "%Y%m%d%H%M%S")
+                    return int(dt.replace(tzinfo=timezone.utc).timestamp())
+                except ValueError:
+                    pass
+    return None
+
+
+def last_rotation(cfg, target):
+    """Epoch da última rotação registrada no JSONL, ou None.
+
+    O log é a fonte de verdade e não o `cdat` do Keychain: `security -U` atualiza
+    o item preservando a data de criação original, então uma credencial rotada
+    continuaria parecendo velha. O `cdat` fica só como piso para quem nunca rodou
+    uma rotação.
+    """
+    path = os.path.join(state_dir(cfg), "mints.jsonl")
+    if not os.path.exists(path):
+        return None
+    found = None
+    with open(path, "r") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("event") == "rotate" and r.get("target") == target \
+                    and r.get("result") == "ok":
+                found = r.get("ts") or found
+    if not found:
+        return None
+    try:
+        dt = datetime.strptime(found, "%Y-%m-%dT%H:%M:%SZ")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return None
+
+
+def rotation_status(cfg):
+    """[(alvo, idade_dias|None, teto_dias, vencida?, origem)] para cada alvo."""
+    linhas = []
+    for target, spec in ROTATION_TARGETS.items():
+        teto = int(cfg["rotation"][spec["days_key"]])
+        ts, origem = last_rotation(cfg, target), "log"
+        if ts is None:
+            ts, origem = keychain_created(spec["keychain"]), "keychain"
+        if ts is None:
+            linhas.append((target, None, teto, False, "ausente"))
+            continue
+        idade = (now() - ts) // 86400
+        linhas.append((target, idade, teto, idade > teto, origem))
+    return linhas
+
+
+def cmd_rotate(cfg, args):
+    if not args.target:
+        print("Rotação — cadências de docs/plano-adocao-tokens.md, Fase 4\n")
+        vencidas = 0
+        for target, idade, teto, venceu, origem in rotation_status(cfg):
+            spec = ROTATION_TARGETS[target]
+            if idade is None:
+                print("  ⚪ %-10s %-32s ainda não custodiada" % (target, spec["label"]))
+                continue
+            vencidas += 1 if venceu else 0
+            print("  %s %-10s %-32s %3dd / %dd  (origem: %s)" % (
+                "🔴" if venceu else "✅", target, spec["label"], idade, teto, origem))
+        print("\n  Rotacionar:  av-broker rotate --target gcp < nova-chave.pem")
+        print("  Passo a passo: docs/runbook-fase4-rotacao.md")
+        return 1 if vencidas else 0
+
+    spec = dict(ROTATION_TARGETS[args.target])
+    # Com mais de uma org, o serviço do Keychain deixa de ser constante: ele passa
+    # a vir do key_provider daquele alvo. Sem isto, rotacionar a chave de produção
+    # gravaria por cima da chave da sandbox — com exit 0 e ✅ na tela.
+    sf_alvo = None
+    if args.target == "salesforce":
+        sf_alvo, sf_bloco = salesforce_target(cfg, getattr(args, "sf_target", None))
+        ref = sf_bloco.get("key_provider") or ""
+        if not ref.startswith("keychain:"):
+            raise BrokerError(
+                "a rotação só sabe gravar em keychain:, e o alvo %r usa %r."
+                % (sf_alvo, ref or "<nada>"))
+        spec["keychain"] = ref.split(":", 1)[1].split("/", 1)[0]
+        spec["label"] = "%s — org %s" % (spec["label"], sf_alvo)
+
+    # O segredo entra por STDIN, nunca por argumento: argv é legível por
+    # qualquer processo do usuário via `ps`.
+    if sys.stdin.isatty():
+        raise BrokerError(
+            "o segredo novo entra por stdin, não por argumento (argv é visível no `ps`).\n"
+            "  av-broker rotate --target %s < nova-chave.pem" % args.target)
+    novo = sys.stdin.read().strip()
+    if not novo:
+        raise BrokerError("stdin vazio — nada a rotacionar.")
+
+    base = {"provider": args.target, "event": "rotate", "project": "rotacao",
+            "target": args.target, "classification": "write"}
+
+    # Rotação é ato de escrita sobre a raiz de confiança: prompta SEMPRE, como
+    # qualquer write (ADR §6.5). Não abre sessão.
+    resumo = ["Rotação de credencial", "",
+              "alvo:      %s" % spec["label"],
+              "keychain:  %s" % spec["keychain"],
+              "efeito:    substitui a credencial em uso nesta máquina"]
+    fp = None
+    if spec["kind"] == "pem":
+        fp = key_fingerprint(novo)   # valida o PEM ANTES de pedir aprovação
+        resumo.append("impressão: %s" % fp)
+    elif spec["kind"] == "token":
+        # Não há como verificar um token contra o servidor sem gastá-lo, então a
+        # defesa possível é reconhecer a forma. Aviso, não erro: o prefixo é
+        # convenção da Anthropic e pode mudar — travar aqui deixaria a rotação
+        # impossível no dia em que mudasse.
+        if not novo.startswith("sk-ant-"):
+            eprint("⚠️  o valor não começa com 'sk-ant-'. Colou a coisa certa?")
+        resumo.append("valor:     %s… (%d caracteres)" % (novo[:12], len(novo)))
+    if args.dry_run:
+        base["dry_run"] = True
+    how = gate(cfg, base, resumo, "rotacionar %s" % spec["label"], args)
+
+    if args.dry_run:
+        audit(cfg, dict(base, approval=how, result="dry-run", fingerprint=fp))
+        print("dry-run: portão e impressão exercitados; Keychain intacto.")
+        return 0
+
+    # Verificação ANTES de trocar: uma chave que não funciona não substitui uma
+    # que funciona. É o que torna a rotação sem downtime — o inverso ("troca e
+    # torce") deixaria a máquina sem credencial válida até alguém perceber.
+    # O ramo de verificação do `github` (GET /app com o JWT da chave nova) saiu
+    # em 18/ago/2026 com o provedor. O alvo `gcp` segue sem verify próprio, e o
+    # `salesforce` mantém o dele logo abaixo.
+    if args.target == "salesforce" and not args.skip_verify:
+        sf = sf_bloco
+        falta = [k for k in ("consumer_key", "integration_user") if not sf.get(k)]
+        if falta:
+            raise BrokerError(
+                "salesforce.%s não configurado no alvo %r — não dá para verificar a\n"
+                "chave nova. Use --skip-verify apenas se souber o que está fazendo."
+                % (", salesforce.".join(falta), sf_alvo))
+        login = str(sf.get("login_url") or "https://login.salesforce.com").rstrip("/")
+        try:
+            assertion = make_jwt({
+                "iss": sf["consumer_key"], "sub": sf["integration_user"],
+                "aud": login, "exp": now() + SF_ASSERTION_TTL,
+            }, novo)
+            http("POST", login + SF_TOKEN_PATH, form=True, body={
+                "grant_type": SF_JWT_GRANT, "assertion": assertion})
+        except BrokerError as exc:
+            audit(cfg, dict(base, approval=how, result="verify-failed",
+                            error=str(exc)[:300]))
+            raise BrokerError(
+                "a chave nova NÃO cunha token no Salesforce — nada foi trocado.\n"
+                "O certificado correspondente já foi subido no External Client App?\n"
+                "O ECA aceita mais de um certificado, então suba o novo ANTES de\n"
+                "rotacionar e só apague o velho depois.\n%s" % exc)
+        print("✅ chave nova cunha token como %s" % sf["integration_user"])
+
+    # O segredo NÃO vai em argv. A versão anterior fazia `-w novo`, o que o
+    # deixava legível no `ps` por qualquer processo do usuário durante a chamada —
+    # justamente o modelo de ameaça deste broker, e contradizendo a regra que os
+    # runbooks afirmam. `security -i` lê o comando por stdin; o argv do processo
+    # fica só "security -i".
+    #
+    # base64 numa linha só porque o comando de `-i` é lido LINHA a linha: um PEM
+    # cru quebraria em várias e só a primeira seria interpretada. O prefixo
+    # `base64:` é o que read_key() desfaz na leitura.
+    # O `account` é DESCOBERTO, não suposto. A versão anterior gravava com
+    # `-a rotate` fixo enquanto os itens reais usam `github` e o e-mail da SA —
+    # ver keychain_account() para o que isso causava.
+    conta = keychain_account(spec["keychain"])
+    if conta is None:
+        raise BrokerError(
+            "item %r não existe no Keychain — não há o que rotacionar.\n"
+            "Se é a primeira gravação, use o runbook da Fase 0."
+            % spec["keychain"])
+    # O chaveiro é DESCOBERTO, não suposto: sem isto a chave nova cairia no
+    # `login`, que é de onde a migração de 02/ago/2026 a tirou. Ver keychain_file().
+    onde = keychain_file(spec["keychain"])
+    keychain_write_hardened(spec["keychain"], conta, novo,
+                            "rotacionada por av-broker em %s" % iso(), onde)
+
+    # Sem esta releitura, "gravei" e "está gravado" seriam a mesma afirmação — e
+    # o defeito do `-a` errado passava justamente por parecer sucesso. Abre um
+    # diálogo de autorização, e é o lugar certo para gastar um: a rotação é rara,
+    # deliberada, e é a hora em que um engano custa a credencial.
+    try:
+        gravado = read_key("keychain:%s" % spec["keychain"])
+    except BrokerError as exc:
+        audit(cfg, dict(base, approval=how, result="verify-readback-failed",
+                        error=str(exc)[:300]))
+        raise BrokerError("gravou mas não consegue ler de volta %r: %s"
+                          % (spec["keychain"], exc))
+    if gravado.strip() != novo.strip():
+        audit(cfg, dict(base, approval=how, result="verify-readback-mismatch"))
+        raise BrokerError(
+            "o Keychain devolveu conteúdo diferente do que foi gravado em %r.\n"
+            "Suspeite de item duplicado sob o mesmo serviço:\n"
+            "  security dump-keychain | grep -A4 %s"
+            % (spec["keychain"], spec["keychain"]))
+    print("✅ releitura confere — a chave em uso é a nova.")
+
+    audit(cfg, dict(base, approval=how, result="ok", fingerprint=fp,
+                    keychain=spec["keychain"], account=conta,
+                    keychain_file=onde))
+    print("✅ %s rotacionada e registrada no log." % spec["label"])
+    if args.target == "salesforce":
+        print("\n⚠️  O certificado ANTIGO continua válido no app até você apagá-lo.")
+        print("   Setup → External Client Apps → seu app → Digital signature.")
+        print("   Só apague depois de confirmar que o broker cunha com a nova:")
+        print("     av-broker salesforce --emit json")
+    return 0
+
+
+# O subcomando `review` (revisao trimestral das instalacoes do GitHub App:
+# selecao minima de repos, teto de permissoes) saiu em 18/ago/2026 junto com o
+# provedor github — ele nao tinha nada que revisar fora do App. Nao ha
+# equivalente para PAT fine-grained pela API; a revisao dos dois PATs se faz na
+# UI do GitHub, em Settings > Developer settings > Personal access tokens.
+
+
+def cmd_doctor(cfg, cfg_path, args):
+    ok = True
+
+    def check(label, good, detail=""):
+        """detail só aparece quando falha — é o conserto, não decoração."""
+        nonlocal ok
+        ok = ok and good
+        print("%s %s%s" % ("✅" if good else "❌", label,
+                           ("" if good or not detail else " — %s" % detail)))
+
+    print("av-broker %s\nconfig: %s\n" % (VERSION, cfg_path))
+    check("config existe", os.path.exists(cfg_path),
+          "usando defaults; copie broker/config.example.json")
+    check("openssl disponível", subprocess.run(
+        ["openssl", "version"], capture_output=True).returncode == 0)
+
+    # O portão é uma escolha, não uma falha: esta máquina não tem biometria
+    # (Mac mini sem teclado Touch ID) e o portão gráfico é o desenho vigente.
+    # Reportar ❌ eterno aqui seria a fadiga de alarme que o §6.5 combate.
+    kind = resolve_gate(cfg)
+    label = {"touchid": "Touch ID (biometria, out-of-band)",
+             "gui": "diálogo do macOS (out-of-band do stdio)",
+             "tty": "desafio digitado no terminal (FRACO — ver README)"}
+    check("portão de aprovação: %s" % label.get(kind, kind), kind != "tty",
+          "sem sessão gráfica; um chamador que controle o stdio aprova sozinho")
+    sd = state_dir(cfg)
+    mode = oct(os.stat(sd).st_mode & 0o777)
+    check("state dir 0o700", mode == "0o700", "%s está %s" % (sd, mode))
+    # Grants e log carregam quem aprovou o quê e quando; nada aqui é legível
+    # por outra conta. O broker escreve 0600, mas um arquivo semeado à mão
+    # (ou herdado) pode estar frouxo.
+    for fname in ("grants.json", "mints.jsonl"):
+        fpath = os.path.join(sd, fname)
+        if not os.path.exists(fpath):
+            continue
+        fmode = oct(os.stat(fpath).st_mode & 0o777)
+        good = fmode == "0o600"
+        check("%s 0o600" % fname, good, "está %s — corrija: chmod 600 %s" % (fmode, fpath))
+    # O check de `github.app_id` saiu em 18/ago/2026 com o provedor: os PATs de
+    # vida longa não têm app_id e o doctor não os diagnostica.
+    #
+    # A chave, não só o ponteiro para ela. O check anterior olhava o app_id e dizia
+    # ✅ com a chave do GitHub DESTRUÍDA no Keychain (truncada em 128 bytes por
+    # uma gravação errada, 29/jul/2026) — o doctor jurava que estava tudo bem e
+    # só a cunhagem real revelava. Um diagnóstico que não toca no segredo não
+    # diagnostica o segredo.
+    #
+    # Mas tocar no segredo custa um diálogo de autorização POR CHAVE, em TODA
+    # execução. A versão anterior deste comentário afirmava que `keychain:` "lê
+    # sem ACL prompt (o item é nosso)" — **era falso**. Medido em 29/jul/2026:
+    # `av-broker-gcp` (criado com `-T ""`) leva ~4,7s de diálogo por leitura;
+    # `av-broker-github` lia em 0,02s só porque a ACL dele estava frouxa — o
+    # comentário descrevia um defeito e o tomava por garantia. Com as duas
+    # chaves endurecidas, o doctor passaria a custar dois diálogos por rodada, e
+    # ele é o comando que mais roda (está no `allow` do .claude/settings.json
+    # por ser barato). Dois diálogos por diagnóstico é a fadiga de consentimento
+    # que o §6.5 existe para evitar.
+    #
+    # Então: presença por default (0,02s, sem prompt — a ACL protege o dado, não
+    # o metadado), conteúdo só em `--deep`. O que NÃO voltamos a fazer é o ✅
+    # silencioso: sem `--deep` o próprio rótulo diz "conteúdo não verificado",
+    # para que ninguém confunda "existe" com "serve".
+    #
+    # `salesforce` usa consumer_key como sentinela de "a fase já rodou" pelo
+    # mesmo critério dos outros dois: é o campo que só existe depois que o App
+    # foi criado na UI. Sem ele aqui, o doctor acompanhava a ROTAÇÃO de uma
+    # chave cuja EXISTÊNCIA nunca conferia (achado de 31/jul/2026).
+    #
+    # Cada org de Salesforce entra como um provider próprio: com duas configuradas,
+    # um ✅ agregado esconderia exatamente o caso que interessa — a de produção
+    # quebrada enquanto a de sandbox responde.
+    # Sem `github` desde 18/ago/2026: aquele PAT não é chave PEM e não passa por
+    # key_provider — o doctor não tem o que conferir nele.
+    provedores = [("gcp", cfg.get("gcp") or {}, "broker_sa_email")]
+    provedores += [("salesforce[%s]" % nome, bloco, "consumer_key")
+                   for nome, bloco in sorted(salesforce_targets(cfg).items())]
+
+    for provider_name, sec, identity in provedores:
+        ref = sec.get("key_provider") or ""
+        # `env:` só tem valor dentro do envelope do `av inject`; ausente aqui é o
+        # esperado, não um defeito.
+        if not ref or ref.startswith("env:"):
+            continue
+        # Provedor cuja fase ainda não rodou não tem chave para estar quebrada —
+        # o key_provider aí é só o default do config. Já existe um check dizendo
+        # que ele está pendente; um ❌ a mais seria ruído (§6.5).
+        if not sec.get(identity):
+            continue
+        if not getattr(args, "deep", False):
+            good, detail = key_present(ref)
+            check("chave de %s presente (conteúdo não verificado — use --deep)"
+                  % provider_name, good, detail)
+            continue
+        try:
+            pem = read_key(ref)
+            good = subprocess.run(["openssl", "pkey", "-noout"],
+                                  input=pem.encode("utf-8"),
+                                  capture_output=True).returncode == 0
+            detail = "o openssl não aceita o que está guardado — chave corrompida"
+        except BrokerError as exc:
+            good, detail = False, str(exc)
+        check("chave de %s legível e válida" % provider_name, good,
+              "%s — regrave: a chave em %s está inutilizável" % (detail, ref))
+
+    check("gcp.broker_sa_email configurado", bool(cfg["gcp"].get("broker_sa_email")),
+          "pendente do setup-sa-broker.sh")
+    ttl = int(cfg["policy"]["session_ttl_seconds"])
+    check("session_ttl dentro do teto", ttl <= SESSION_TTL_CEILING,
+          "%ds > %ds (ADR §6.5)" % (ttl, SESSION_TTL_CEILING))
+    # Fase 4: uma credencial vencida não é um erro de instalação, mas é
+    # exatamente o que o doctor deveria dizer antes de alguém confiar nele.
+    # Credencial ainda não custodiada não conta como vencida — é pendência de
+    # outra fase, e marcá-la em vermelho todo dia é a fadiga de alarme do §6.5.
+    for target, idade, teto, venceu, _origem in rotation_status(cfg):
+        if idade is None:
+            continue
+        check("rotação de %s em dia (%dd/%dd)" % (target, idade, teto), not venceu,
+              "vencida — rode: av-broker rotate --target %s" % target)
+    return 0 if ok else 1
+
+
+# -------------------------------------------------------------------- main
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="av-broker",
+        description="Cunhagem JIT de credenciais efêmeras (docs/plano-adocao-tokens.md, Fase 3)",
+    )
+    p.add_argument("--config", help="caminho do config.json")
+    p.add_argument("--version", action="version", version="av-broker %s" % VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_common(sp):
+        sp.add_argument("--project", help="chave da sessão (default: repo/SA)")
+        sp.add_argument("--emit", choices=["token", "json"], default="token",
+                        help="formato de saída; transporte do shuru entra aqui na Fase 2")
+        sp.add_argument("--dry-run", action="store_true",
+                        help="valida política/classificação/log sem chamar a API")
+        sp.add_argument("--no-prompt", action="store_true",
+                        help="falha em vez de promptar (para uso não-interativo)")
+
+    # Sem subcomandos `github`, `review` e `agent` desde 18/ago/2026 — ver a nota
+    # perto do topo do arquivo.
+    c = sub.add_parser("gcp", help="access token por impersonation")
+    c.add_argument("--target-sa", required=True, metavar="EMAIL")
+    c.add_argument("--scope", action="append", metavar="URL",
+                   help="repetível; default cloud-platform")
+    c.add_argument("--lifetime", type=int, default=3600, help="segundos (teto 3600)")
+    add_common(c)
+
+    # Sem --read-only aqui de propósito: a classificação vem SÓ do config, para
+    # que um chamador não possa rebaixá-la (ver classify_salesforce).
+    sfp = sub.add_parser("salesforce", help="access token por JWT Bearer (ADR §6.2)")
+    sfp.add_argument("--target", help="qual org (ver salesforce.targets no config). "
+                                      "Com mais de uma e sem default, é obrigatório.")
+    add_common(sfp)
+
+    s = sub.add_parser("session", help="sessões de aprovação (grants)")
+    ss = s.add_subparsers(dest="session_action", required=True)
+    ss.add_parser("list")
+    r = ss.add_parser("revoke")
+    r.add_argument("--project")
+    r.add_argument("--all", action="store_true")
+
+    l = sub.add_parser("log", help="lê o JSONL de auditoria")
+    l.add_argument("-n", type=int, default=20)
+    l.add_argument("--raw", action="store_true")
+
+    p_doctor = sub.add_parser("doctor", help="verifica a instalação")
+    # Sem --deep o doctor não lê valor de segredo nenhum, e por isso não abre
+    # diálogo de autorização. Com --deep ele lê e valida no openssl, ao custo de
+    # um diálogo por chave — é o modo para depois de gravar ou rotacionar chave.
+    p_doctor.add_argument("--deep", action="store_true",
+                          help="também lê e valida o conteúdo das chaves "
+                               "(abre um diálogo de autorização por chave)")
+
+    ro = sub.add_parser("rotate", help="rotação de credencial (Fase 4)")
+    ro.add_argument("--target", choices=sorted(ROTATION_TARGETS),
+                    help="sem isto, mostra o status das cadências")
+    # Flag separada de --target de propósito: `--target` aqui é o que rotacionar
+    # (gcp/salesforce/…), `--sf-target` é QUAL org de Salesforce. Reusar o
+    # mesmo nome para as duas coisas convidaria a rotacionar a chave da org errada.
+    ro.add_argument("--sf-target",
+                    help="com --target salesforce: qual org (ver salesforce.targets)")
+    ro.add_argument("--skip-verify", action="store_true",
+                    help="grava sem provar que a chave nova autentica (não use)")
+    add_common(ro)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        cfg, cfg_path = load_config(args.config)
+        if args.cmd == "salesforce":
+            return cmd_salesforce(cfg, args)
+        if args.cmd == "gcp":
+            return cmd_gcp(cfg, args)
+        if args.cmd == "session":
+            return cmd_session(cfg, args)
+        if args.cmd == "log":
+            return cmd_log(cfg, args)
+        if args.cmd == "doctor":
+            return cmd_doctor(cfg, cfg_path, args)
+        if args.cmd == "rotate":
+            return cmd_rotate(cfg, args)
+    except BrokerError as exc:
+        eprint("av-broker: %s" % exc)
+        return 2
+    except KeyboardInterrupt:
+        eprint("\ninterrompido.")
+        return 130
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

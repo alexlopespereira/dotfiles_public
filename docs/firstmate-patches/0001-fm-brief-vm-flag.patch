@@ -1,0 +1,120 @@
+From 02a738d2a3fd0c01abfeb33bbdb0518c10475653 Mon Sep 17 00:00:00 2001
+From: Alex Lopes Pereira <noreply@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 00:24:35 -0300
+Subject: [PATCH] feat(brief): flag --vm para briefs no-mistakes dentro da
+ microVM
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Duas diferencas em relacao ao host, e so essas duas.
+
+Regra 7: a proibicao de mexer no daemon continua, mas o motivo passa a ser
+verdadeiro no contexto. Na VM o daemon e do proprio crewmate, nao uma
+instancia compartilhada — reinicia-lo nao machuca outras lanes, destroi o
+run dele. Regra cuja razao declarada e falsa e regra que agente aprende a
+descontar.
+
+Linha final: na VM o crewmate faz o merge (squash + apaga a branch,
+tolerando "already merged") e reporta done: PR {url} merged. A microVM e
+destruida no fim do run, entao um PR parado em CI-verde nao teria quem o
+mergeasse. Casa com a metodologia do capitao — ele confere o resultado,
+nao o merge.
+
+O caminho do host sai byte a byte identico ao anterior (regra 7 e linha
+final comparadas contra o brief do nm-cpf-1, gerado antes da mudanca).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018QWb2syf9uXhfQzzDkt8rx
+---
+ bin/fm-brief.sh | 40 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/bin/fm-brief.sh b/bin/fm-brief.sh
+index 9c98723..7d218cc 100755
+--- a/bin/fm-brief.sh
++++ b/bin/fm-brief.sh
+@@ -21,6 +21,10 @@
+ #   omitting both still fails loudly so an accidental omission is never silent.
+ #   Set FM_SECONDMATE_CHARTER='<charter>' to fill the charter text.
+ #   Set FM_SECONDMATE_SCOPE='<scope>' to write a routing scope distinct from the charter text.
++#   --vm says the crewmate runs inside a shuru microVM. It changes two things in a
++#   no-mistakes brief: the daemon is the VM's own (not the host's shared instance),
++#   and the crewmate merges its own PR after CI is green, because the VM is torn
++#   down at the end of the run and nothing would be left to merge it.
+ #   --herdr-lab is mandatory when the task will issue Herdr lifecycle commands.
+ #   It adds the hard isolation contract backed by bin/fm-herdr-lab.sh.
+ #   The flag must be explicit because {TASK} is filled after scaffolding and the
+@@ -94,12 +98,16 @@ fi
+ KIND=ship
+ HERDR_LAB=0
+ NO_PROJECTS=0
++# --vm: the crewmate runs inside a shuru microVM, where the no-mistakes daemon is
++# the VM's own (born at boot, dies with it) instead of the host's shared one.
++VM=0
+ POS=()
+ for a in "$@"; do
+   case "$a" in
+     --scout) KIND=scout ;;
+     --secondmate) KIND=secondmate ;;
+     --herdr-lab) HERDR_LAB=1 ;;
++    --vm) VM=1 ;;
+     --no-projects) NO_PROJECTS=1 ;;
+     *) POS+=("$a") ;;
+   esac
+@@ -302,6 +310,32 @@ read -r MODE _ <<EOF
+ $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
+ EOF
+ 
++# Rule 7 and the no-mistakes finish line both hinge on WHERE the daemon lives.
++# On the host it is one shared instance and restarting it kills other lanes'
++# in-flight runs. Inside a shuru microVM it is that VM's own daemon, started by
++# the guest setup before the agent exists - nobody else is on it. The prohibition
++# stays either way (a crewmate that restarts its daemon mid-run still destroys its
++# own pipeline state), but the reason changes, and a rule whose stated reason is
++# false in context is a rule agents learn to discount.
++if [ "$VM" -eq 1 ]; then
++  RULE7='7. Never stop, restart, or update the `no-mistakes` daemon. In this microVM it is YOURS - the
++   guest setup started it before you existed and it dies with the VM - so restarting it does not
++   hurt other lanes, it destroys your own in-flight run and the gate state with it. On ANY
++   no-mistakes daemon error, append `blocked: {the daemon error}` and stop.'
++  # The VM is torn down when the run ends. A PR left open at CI-green would have
++  # nobody to merge it, so here the crewmate closes the loop itself - matching the
++  # captain'"'"'s methodology: he checks the result, not the merge.
++  NM_FINISH='After /no-mistakes reports CI green, merge the PR yourself with `gh`: squash merge and delete the branch.
++Tolerate a "already merged" / "not mergeable" response by re-reading the PR state before deciding it failed - a merge that already landed is success, not an error.
++Then append `done: PR {url} merged` and stop. You are finished.
++This differs from the host flow on purpose: the microVM is destroyed when your run ends, so a PR left at CI-green would have nobody to merge it.'
++else
++  RULE7='7. Never stop, restart, or update the shared `no-mistakes` daemon - it is one instance serving
++   every lane/home, so restarting it kills other lanes'"'"' in-flight pipeline runs. On ANY no-mistakes
++   daemon error, append `blocked: {the daemon error}` and stop; only firstmate manages the daemon.'
++  NM_FINISH='After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append `done: PR {url} checks green` and stop. You are finished.'
++fi
++
+ case "$MODE" in
+   direct-PR)
+     SETUP2=""
+@@ -346,7 +380,7 @@ Two firstmate-specific rules layer on top of that guidance:
+   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
+ - Avoid \`--yes\`: it would silently bypass firstmate's authority check and any required captain escalation.
+ 
+-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
++$NM_FINISH
+ EOF
+     ;;
+ esac
+@@ -394,9 +428,7 @@ $RULE1
+ 6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
+    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
+    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
+-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
+-   daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
++$RULE7
+ 
+ # Project memory
+ If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+-- 
+2.50.1 (Apple Git-155)
+

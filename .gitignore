@@ -1,0 +1,64 @@
+# herdr runtime artifacts (regenerated at runtime; never commit)
+# NB: ~/.config/herdr e um mkOutOfStoreSymlink pra ca, entao o herdr escreve
+# runtime direto no repo. Qualquer artefato novo que ele criar entra aqui.
+home/.config/herdr/*.log
+home/.config/herdr/session.json
+home/.config/herdr/*.sock
+home/.config/herdr/*.lock
+# release-notes.json parece config, mas e cache do "o que ha de novo" da
+# versao instalada (version + body + show_on_startup) e muda a cada upgrade.
+home/.config/herdr/release-notes.json
+
+# macOS + nix build noise
+.DS_Store
+result
+result-*
+
+# no-mistakes local validation state - never commit
+.no-mistakes/
+
+# @playwright/mcp escreve snapshots, traces e DOWNLOADS aqui, relativo ao cwd —
+# ou seja, dentro do repo. O download da chave privada do GitHub App
+# (runbook privado da Fase 0, §1) cai exatamente aqui. Ignorar nao basta: mova o
+# .pem para o Keychain e apague. O scripts/finish-github-app.sh, que fazia os
+# dois para o GitHub App, saiu em 18/ago/2026 junto com o App; o padrao segue
+# valendo para as chaves de gcp e salesforce (ver scripts/salesforce-keypair.sh).
+.playwright-mcp/
+# Worktrees de sessoes do Claude Code: repos git embutidos, nunca versionados.
+.claude/worktrees/
+
+# Pool do treehouse. `root = "./"` no config resolve relativo ao REPO, entao o
+# pool inteiro nasce aqui dentro (decisao consciente: a VM do shuru monta so o
+# repo e assim alcanca os worktrees sem mount novo).
+#
+# Declarado ANTES do primeiro uso de proposito. O treehouse escreve esta linha
+# sozinho, mas so na primeira aquisicao — e ate la o alias `add` (= `git add .`,
+# home.nix) empurraria o pool INTEIRO para dentro do historico. Nao dependa de um
+# upstream escrever o seu .gitignore na hora certa.
+/.treehouse/
+/.treehouse
+
+# Artefatos que agentes de navegador largam na RAIZ do repo (o cwd deles).
+# Medido em 1/ago/2026: `orders-list.png` (captura de tela) e `tab1-atoz.yml`
+# (snapshot de acessibilidade do Playwright, cheio de `[ref=eN]`) apareceram
+# soltos aqui. O `.playwright-mcp/` acima nao pega esses: sao gravacoes que a
+# ferramenta escreve direto no cwd, fora do diretorio dela.
+#
+# Importa por causa do alias `add` (= `git add .`, home.nix): sem estas linhas
+# um screenshot entra no historico por acidente, e imagem nao sai de historico
+# com um `git rm`.
+#
+# Ancorado na RAIZ de proposito, nao `*.png` cego. Nenhuma imagem e versionada
+# hoje, mas ignorar por extensao no repo inteiro esconderia um `docs/imagens/`
+# legitimo no dia em que existir — e o sintoma seria "o git nao ve meu arquivo",
+# que se perde muito tempo para diagnosticar.
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+# YAML na raiz e sempre despejo de ferramenta neste repo: o YAML de verdade mora
+# em .github/ (workflows, templates de issue), que estas linhas nao alcancam.
+# Se um dia a raiz precisar de um YAML legitimo, `git add -f` resolve pontual.
+/*.yml
+/*.yaml

@@ -1,0 +1,34 @@
+{
+  "_": "Projeto piloto da Fase 1 (docs/plano-adocao-tokens.md). Versionado de proposito: a allowlist de rede e config de seguranca, e config de seguranca mora em git (checklist 7.2). Rode com: shuru run --from base",
+
+  "_offline": "OFFLINE POR DEFAULT (item 5.6). allow_net FICA FALSE. Sem ele o guest nao recebe device de rede nenhum — nao e cooperacao, e ausencia de caminho. Para uma tarefa que precise de rede, passe --allow-net na linha de comando daquela sessao em vez de mexer aqui: o default do arquivo e o que protege quando ninguem esta prestando atencao.",
+  "allow_net": false,
+
+  "_mounts": "So o repo deste projeto (regra de ouro 5.3). READ-ONLY, sem excecao. Sem ':rw' o guest recebe um overlayfs cujo upperdir vive no disco da VM — medido em 30/jul/2026 com `df --output=fstype`, que devolve `overlay` para este mount, `virtiofs` para um mount ':rw' e `ext4` para o disco do guest. (A descricao anterior dizia 'overlay tmpfs'; o upperdir nao e tmpfs.) A escrita do guest NAO alcanca o host.",
+  "_mounts_nunca_rw": "NUNCA promova este mount para ':rw'. Ate 30/jul/2026 este arquivo mandava fazer exatamente isso, 'para o agente commitar de verdade' — era o conselho certo enquanto a unica saida do trabalho era escrever no host, e virou o pior conselho do arquivo quando deixou de ser, porque vem com a autoridade de estar na config de seguranca. Com ':rw' o guest ganha escrita no .git do HOST, .git/hooks incluso, o que e execucao de codigo na SUA maquina no proximo commit ou checkout. Isso nao e hipotese: em 30/jul/2026 o reflog de ~/Projects/shuru-fm-probe mostrou um commit feito de dentro da VM chegando ao host por essa via.",
+  "_mounts_como_commitar": "O agente commita clonando o repo DENTRO da VM — `git clone <mount> /work`, sem rede e instantaneo, o que lhe da um .git de verdade em ext4 — e entrega o resultado por PR com token efemero do broker. Um `git commit` feito no proprio mount nao da erro: ele grava no upperdir e evapora no fim do boot, que e o modo de falha mais caro possivel. Ver scripts/shuru-pr.sh e scripts/claude-shuru.",
+  "mounts": ["./:/workspace"],
+
+  "cpus": 4,
+  "memory": 4096,
+  "disk_size": 8192,
+
+  "_network": "So vale quando allow_net estiver ligado por flag. Minima: o que o Claude Code precisa para falar com a API, mais os registries. github.com NAO esta aqui, e continua fora de proposito: acesso a repo e decisao DAQUELA sessao, nunca default. Ate 18/ago/2026 a frase aqui dizia 'vem do token do broker'; desde entao o alvo github saiu do av-broker e o que chega na VM e um PAT fine-grained de vida longa, entregue por mount read-only em /ghcred/token (o shuru run nao tem --env). Ver scripts/claude-shuru e scripts/gh-pat.sh. Quem precisar de GitHub numa sessao passa --allow-host github.com --allow-host api.github.com naquela sessao.",
+  "_network_platform": "platform.claude.com adicionado em 29/jul/2026. O Claude Code INTERATIVO faz um preflight contra esse host no startup e SE RECUSA A SUBIR se ele nao resolver — o sintoma era 'Failed to connect to platform.claude.com: ENOTFOUND', que e o resolver do shuru devolvendo ancount=0 para nome fora da lista (Fase 2, teste 11), nao falta de internet. Medido: `claude -p` NAO faz esse preflight e funcionava sem o host, entao o teste tem que ser com a TUI. Alargamento consciente, e barato: e dominio da propria Anthropic, mesma classe de confianca de api.anthropic.com, e NAO ganha o segredo — a lista de `secrets.hosts` abaixo e independente desta e continua so com api.anthropic.com. statsig.anthropic.com fica DE FORA de proposito: e telemetria/feature-flags, e o cliente sobe sem ele.",
+  "network": {
+    "allow": [
+      "api.anthropic.com",
+      "platform.claude.com",
+      "registry.npmjs.org",
+      "pypi.org"
+    ]
+  },
+
+  "_secrets": "O guest recebe placeholder; o proxy troca pelo valor real so no egress para os hosts listados. NAO ha entrada de GITHUB_TOKEN aqui, e a ausencia deixou de ser so politica: desde 18/ago/2026 o PAT do GitHub nao viaja por este mecanismo, e sim por mount read-only (/ghcred/token) — o guest ve o valor REAL, de proposito. Verificado em 29/jul/2026: a troca acontece por substituicao de bytes no stream TLS ja decifrado, entao cobre o header Authorization (ver docs/plano-adocao-tokens.md, Fase 1). CLAUDE_CODE_OAUTH_TOKEN e a variavel do host, cunhada por `claude setup-token` e guardada no Keychain — ela nao pode estar no shell do dia a dia; exporte-a so na sessao que sobe a VM.",
+  "secrets": {
+    "CLAUDE_CODE_OAUTH_TOKEN": {
+      "from": "CLAUDE_CODE_OAUTH_TOKEN",
+      "hosts": ["api.anthropic.com"]
+    }
+  }
+}

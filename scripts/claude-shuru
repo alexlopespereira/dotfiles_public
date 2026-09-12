@@ -1,0 +1,654 @@
+#!/bin/sh
+# Roda o Claude Code DENTRO da VM shuru do projeto, a partir de um worktree.
+#
+# Existe para o firstmate poder delegar uma tarefa que executa na VM em vez do
+# host. É usado como "launch command cru" do fm-spawn:
+#
+#   fm-spawn.sh <id> <proj> --harness \
+#     'claude-shuru --turnend __TURNEND__ --from <checkpoint> --github-write OWNER/REPO -- "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+#
+# __MODELFLAG__/__EFFORTFLAG__ cabem depois do `--` se a tarefa pedir modelo ou
+# esforço explícitos; o fm-spawn substitui os dois em launch cru também
+# (fm-spawn.sh:1506).
+#
+# O NOME `claude-shuru` não é estético: fm-spawn.sh:486 deriva o HARNESS do
+# basename da primeira palavra do launch cru, e o hook de Stop só é instalado
+# quando esse basename casa `claude*` (linha 1335). `shuru-claude` não casaria e
+# o spawn silenciosamente não instalaria hook nenhum.
+#
+# Uso direto (sem firstmate), de dentro de um worktree:
+#   claude-shuru -- "diga ok e saia"
+#   claude-shuru --offline -- "..."      # sem rede
+#   claude-shuru --from meu-projeto -- "..."
+#   claude-shuru --from meu-projeto --github -- "..."
+#   claude-shuru --from meu-projeto --github --no-mistakes -- "..."
+#
+# Pipeline em DUAS ETAPAS — desde 18/ago/2026 OPCIONAL, e a razão mudou:
+#   Ele nasceu porque o token de instalação vivia 1 h e podia morrer no meio do
+#   trabalho caro, matando `pr` e `ci` com 401 depois do esforço. Com PAT de vida
+#   longa isso não acontece mais, e um run de uma etapa só funciona. O que
+#   sobrou de valor é MENOR EXPOSIÇÃO: a etapa 1 é a longa, a que roda o código
+#   de terceiro e o agente solto, e ela não precisa ver credencial nenhuma.
+#   # etapa 1 — cara, longa, SEM token; salva o disco
+#   claude-shuru --from meu-projeto --stage1 etl-wip -- "... rode
+#     `no-mistakes axi run --skip rebase,push,pr,ci` ..."
+#   # etapa 2 — curta; recebe o PAT e só então empurra
+#   claude-shuru --from etl-wip --github --no-mistakes -- "... rode
+#     `no-mistakes axi run --skip review,test,document,lint` ..."
+#   ~/.local/bin/shuru checkpoint delete etl-wip    # o WIP são ~GB; apague depois
+set -eu
+
+SHURU="${SHURU:-$HOME/.local/bin/shuru}"
+[ -x "$SHURU" ] || { echo "erro: shuru ausente — rode scripts/install-shuru.sh" >&2; exit 1; }
+
+REDE="--allow-net"
+CHECKPOINT="base"
+TURNEND=""
+GH_WRITE=""
+# Pipeline do no-mistakes DENTRO do guest. Opt-in de propósito: o caminho
+# `direct-PR` (shuru-pr) está provado de ponta a ponta e não tem por que mudar
+# de comportamento porque este outro passou a existir.
+NM=0
+# --stage1: etapa cara do pipeline SEM token do GitHub, salvando o disco como
+# checkpoint. Nasceu de uma aritmética que não vale mais — o token de instalação
+# vivia 1 h e um run com `review` podia passar disso, matando `pr` e `ci` com 401
+# DEPOIS do trabalho caro. O PAT de vida longa (18/ago/2026) resolveu isso, e
+# ainda assim a flag FICA, por outro motivo, que é melhor: a etapa 1 é a longa,
+# a que roda código de terceiro com o agente solto, e ela não precisa ver
+# credencial nenhuma. Continua não havendo como injetar segredo numa VM de pé.
+#
+# O `/work` e o `~/.no-mistakes` do guest sobrevivem dentro do checkpoint, então
+# a etapa 2 continua de onde a 1 parou sem bundle, sem mount de escrita e sem
+# importar nada no host.
+STAGE1_CP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --offline) REDE=""; shift ;;
+    --from)    CHECKPOINT="${2:?--from exige um nome de checkpoint}"; shift 2 ;;
+    --turnend) TURNEND="${2:?--turnend exige um caminho}"; shift 2 ;;
+    # `--github` nao pede repo: o alcance agora e o escopo do PAT, definido no
+    # github.com/settings, e nao um argumento aqui. `--github-write OWNER/REPO`
+    # fica como alias que IGNORA o repo, so para nao quebrar invocacoes e hooks
+    # do firstmate que ja existem; ele some quando ninguem mais o digitar.
+    --github)  GH_WRITE=1; shift ;;
+    # `shift 2` cegamente aborta em `dash` quando o repo nao vem junto ("can't
+    # shift that many"), e o alias existe justamente para invocacoes antigas que
+    # podem estar malformadas. Engole o argumento so se ele existir e nao for
+    # outra flag.
+    --github-write)
+      GH_WRITE=1; shift
+      case "${1:-}" in ""|-*) ;; *) shift ;; esac ;;
+    --no-mistakes) NM=1; shift ;;
+    --stage1)  STAGE1_CP="${2:?--stage1 exige o nome do checkpoint de saída}"
+               NM=1; shift 2 ;;
+    --)        shift; break ;;
+    *)         break ;;
+  esac
+done
+
+# Token na etapa 1 seria pior que inútil. Ele expiraria durante o trabalho e, no
+# `no-mistakes`, token morto não dá erro: o `Available()` roda `gh auth status` e
+# trata saída ≠ 0 como "não autenticado", PULANDO `pr` e `ci` em silêncio com o
+# run reportando `outcome: passed`. Recusar aqui é o que impede a etapa 1 de
+# parecer sucesso completo.
+if [ -n "$STAGE1_CP" ] && { [ -n "$GH_WRITE" ] || [ -n "${GITHUB_TOKEN:-}" ]; }; then
+  echo "erro: --stage1 não aceita token do GitHub (--github ou GITHUB_TOKEN)." >&2
+  echo "      A etapa 1 roda o pipeline com --skip push,pr,ci; o token é da etapa 2." >&2
+  exit 1
+fi
+
+# O pipeline lê o resultado do CI, e sem token não há o que ler. Falhar aqui é
+# barato; falhar lá dentro custa o boot inteiro e o trabalho do agente. A etapa 1
+# é a exceção declarada: ela pula justamente os passos que precisam de token.
+if [ "$NM" = 1 ] && [ -z "$STAGE1_CP" ] \
+   && [ -z "$GH_WRITE" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "erro: --no-mistakes exige --github (ou GITHUB_TOKEN no ambiente)." >&2
+  exit 1
+fi
+
+# GEOMETRIA (decisão do Alex, 30/jul/2026 — substitui o mount de escrita)
+#
+#   HOST                                  VM
+#   worktree do treehouse   <- âncora     git clone <repo> /work   <- onde o agente trabalha
+#   (o agente NÃO trabalha nele)          shuru-pr -> PR -> squash-merge
+#
+# O repo entra READ-ONLY. O agente lê tudo, e o `.git` do host fica inalcançável
+# — o que fecha o vetor `.git/hooks`, que é execução de código na SUA máquina no
+# próximo commit ou checkout. O trabalho sai por rede, num PR, com token do
+# broker escopado a um repo por uma hora.
+#
+# Por que o worktree continua existindo: fm-spawn.sh:881 RECUSA lançar se o
+# worktree não for distinto do checkout primário ("refusing to launch to avoid
+# tangling the primary checkout"), e para todo backend menos orca ele vem de um
+# `treehouse get` digitado no pane (linha 1262). Treehouse é dependência dura do
+# firstmate; o que fizemos foi mantê-lo FORA da VM.
+#
+# ⚠️ bin/fm-brief.sh:370 manda o crewmate verificar que `pwd -P` e
+# `git rev-parse --show-toplevel` caem no worktree em que ele foi lançado. Nesta
+# geometria eles caem em /work. É texto de brief, não um portão — mas um agente
+# obediente pode se recusar a trabalhar. Se acontecer, é aqui que está o porquê.
+#
+# WT é o worktree em que o pane nasceu; REPO é o repo principal. Montamos o REPO
+# inteiro, espelhado no mesmo caminho absoluto, porque o `.git` de um worktree
+# linked é um arquivo `gitdir: <repo>/.git/worktrees/<nome>` e só resolve assim.
+WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "erro: não estou num repositório git. A VM monta um repo, não um diretório solto." >&2
+  exit 1
+}
+COMMON=$(git rev-parse --git-common-dir)
+case "$COMMON" in /*) ;; *) COMMON="$(pwd -P)/$COMMON" ;; esac
+REPO=$(cd "$COMMON/.." && pwd -P)
+
+# Mesma recusa do shuru-vm.sh, e pelo mesmo motivo: sem shuru.json o
+# `--allow-net` sobe com rede IRRESTRITA, o oposto dos itens 5.6 e 7.2. A
+# allowlist é decisão de segurança do HOST, então vem do repo principal e não do
+# worktree — o branch em que o agente trabalha não escolhe o próprio sandbox.
+[ -f "$REPO/shuru.json" ] || {
+  cat >&2 <<FIM
+erro: $REPO/shuru.json não existe.
+
+Cada projeto declara a própria allowlist de rede, versionada em git (itens 5.3 e
+7.2). Sem esse arquivo, --allow-net daria rede irrestrita à VM.
+FIM
+  exit 1
+}
+
+TOKEN=$(security find-generic-password -s claude-setup-token -w 2>/dev/null || true)
+if [ -z "$TOKEN" ]; then
+  cat >&2 <<'FIM'
+erro: setup-token não custodiado. Ver o runbook privado da Fase 0 §2.
+FIM
+  exit 1
+fi
+case "$TOKEN" in
+  sk-ant-*) ;;
+  *) echo "aviso: o valor no Keychain não parece um setup-token." >&2 ;;
+esac
+
+# A imagem-base tem git mas NÃO tem user.name/user.email globais (medido), então
+# um `git commit` do crewmate falharia dentro da VM. Passamos identidade por
+# ambiente (não `git config`, que escreveria no .git do host via mount rw).
+#
+# A identidade é a do AGENTE, não a do humano, e isso é deliberado: scripts/
+# shuru-pr.sh:197 já atribui commits feitos de dentro da VM a shuru-agent, e
+# GIT_AUTHOR_*/GIT_COMMITTER_* têm precedência sobre `git config` — passar
+# `user.name` do host aqui sobrescreveria essa convenção em silêncio e faria
+# trabalho de VM parecer commit do humano. Mesmos valores do shuru-pr.sh para o
+# histórico ficar coerente pelos dois caminhos.
+GIT_NAME="${CLAUDE_SHURU_GIT_NAME:-shuru-agent}"
+GIT_EMAIL="${CLAUDE_SHURU_GIT_EMAIL:-shuru-agent@users.noreply.github.com}"
+
+# TOKEN DO GITHUB — herdado do ambiente, ou lido do keychain com --github.
+#
+# Ate 18/ago/2026 esta secao CUNHAVA um token de instalacao do GitHub App por
+# tarefa, com TTL de 1 h. Agora ela le um PAT fine-grained de vida longa do login
+# keychain (item `github-pat-vm`, ver scripts/gh-pat.sh). Sao dois PATs: este,
+# que viaja para dentro do guest, e o `github-pat`, que fica so no Mac. Um por
+# lugar e o que permite saber qual copia vazou e revogar so ela.
+#
+# Herdar do ambiente e o caminho do uso DIRETO (sem firstmate):
+#
+#   GITHUB_TOKEN="$(gh-pat get vm)" claude-shuru -- "..."
+#
+# Herdar NAO funciona sob o firstmate, e isso foi medido em 30/jul/2026: o
+# fm-spawn nao executa o launch, ele o DIGITA num pane novo (bin/backends/
+# tmux.sh:91, `tmux new-window`), e o ambiente desse pane vem do servidor do
+# tmux — do daemon do herdr, no outro backend —, nao do processo que chamou o
+# fm-spawn. Um `GITHUB_TOKEN=... fm-spawn.sh ...` fica pelo caminho e o crewmate
+# sobe sem poder de escrita. Prefixar o token no comando digitado resolveria e
+# esta fora de questao: ele iria para o argv (legivel no `ps`) e para o
+# scrollback do pane.
+#
+# Dai `--github`: a leitura acontece DENTRO do pane, e o token e saida de comando
+# capturada em variavel. Sem a flag e sem a variavel, a VM sobe igual e o
+# `shuru-pr` recusa a rodar — nao ha degradacao silenciosa, e uma tarefa de
+# leitura simplesmente nao recebe o token.
+#
+# O QUE SE PERDEU AQUI, dito sem eufemismo: antes o gesto humano (o dialogo do
+# macOS no spawn) era a decisao de que ESTA tarefa tinha escrita no GitHub, e o
+# token morria em 1 h com escopo de um repo so. Agora `--github` entrega uma
+# credencial de vida longa a um agente autonomo rodando com
+# --dangerously-skip-permissions. O escopo do PAT no github.com/settings e a
+# UNICA contencao que restou — trate-o como o limite real do estrago, porque e.
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+if [ -z "$GITHUB_TOKEN" ] && [ -n "$GH_WRITE" ]; then
+  command -v gh-pat >/dev/null 2>&1 || {
+    echo "erro: --github pede o gh-pat, ausente do PATH (scripts/gh-pat.sh)." >&2
+    exit 1
+  }
+  GITHUB_TOKEN=$(gh-pat get vm) || {
+    echo "erro: nao consegui ler o PAT 'github-pat-vm' do keychain." >&2
+    echo "      Grave com: gh-pat set vm" >&2
+    exit 1
+  }
+  [ -n "$GITHUB_TOKEN" ] || { echo "erro: gh-pat devolveu token vazio." >&2; exit 1; }
+fi
+[ -n "$GITHUB_TOKEN" ] || \
+  echo "aviso: sem GITHUB_TOKEN — o agente nao conseguira abrir PR (shuru-pr recusa)." >&2
+
+# COMO O TOKEN ENTRA NA VM: por mount read-only, e nao por variavel.
+#
+# O `shuru run` nao tem `--env`. O unico canal declarado e `--secret NAME=ENV@
+# HOSTS`, que injeta um PLACEHOLDER no guest e so troca pelo valor real no
+# egress, dentro do proxy. Isso era exatamente o que se queria enquanto o guest
+# nao devia ver o segredo — e e o que deixou de ser verdade em 18/ago/2026: a
+# decisao foi que o PAT fique disponivel DENTRO do container, para que `gh` e
+# `git` funcionem nativamente la sem nenhuma coreografia de substituicao.
+#
+# Entao escrevemos o token num diretorio temporario do host, 0700/0600, e o
+# montamos read-only. O guest le o arquivo no boot e exporta GH_TOKEN. Efeito
+# colateral bom: some a dependencia de cada projeto declarar
+# `secrets.GITHUB_TOKEN` no shuru.json dele — o canal agora e o mesmo em todo
+# repo. Efeito colateral ruim, e e o preco aceito: qualquer codigo que rode na
+# VM le /ghcred/token.
+#
+# argv esta fora de questao pelo motivo de sempre (`ps`), e o mount do repo nao
+# serve porque ele e o repo do host — o token acabaria versionado ou visivel no
+# worktree.
+# Definida INCONDICIONALMENTE, e nao dentro do `if` abaixo: o trap do relay a
+# menciona sempre, e uma sessao sem token cairia em "command not found" no
+# encerramento — erro barulhento no fim de todo run sem GitHub.
+GHCRED=""
+cleanup_ghcred() { [ -z "$GHCRED" ] || rm -rf "$GHCRED"; GHCRED=""; }
+
+if [ -n "$GITHUB_TOKEN" ]; then
+  GHCRED=$(mktemp -d "${TMPDIR:-/tmp}/claude-shuru-ghcred.XXXXXX")
+  chmod 700 "$GHCRED"
+  ( umask 077; printf '%s\n' "$GITHUB_TOKEN" > "$GHCRED/token" )
+  # A limpeza vai por FUNCAO, e nao por `trap` direto, porque este script ja
+  # instala outro trap EXIT mais abaixo (o do relay) — e `trap` nao acumula, ele
+  # SUBSTITUI. Um segundo `trap ... EXIT` aqui seria silenciosamente descartado
+  # e o token ficaria no /tmp do host ate o proximo boot, que e onde segredos vao
+  # morar quando ninguem olha.
+  trap 'cleanup_ghcred' EXIT HUP INT TERM
+fi
+
+# --- relay de turn-end e de status -------------------------------------------
+# O hook que o fm-spawn escreve faz `touch <firstmate>/state/<id>.turn-ended`,
+# caminho que não existe dentro do guest — o touch falharia calado e o firstmate
+# nunca veria o fim do turno. Relayamos: o guest escreve um marker num mount de
+# escrita mínimo e o host o converte no arquivo que o firstmate espera.
+#
+# O MESMO buraco vale para o arquivo de status: o brief manda o crewmate fazer
+# `echo "done: ..." >> <firstmate>/state/<id>.status`, e esse diretório também
+# não existe no guest. Sem relay o firstmate receberia turn-end mas nunca
+# `done:`/`blocked:`/`needs-decision:` — supervisão meio cega, que é pior do que
+# nenhuma porque parece funcionar. O guest escreve em /fmsignal/status e o host
+# anexa ao arquivo real.
+#
+# O marker NÃO pode mais morar no worktree: com o repo montado read-only, um
+# `touch` lá cairia no overlay e o host nunca veria nada — falha silenciosa, que
+# é o pior modo de falha possível num sinal de fim de turno. Daí um mount
+# dedicado, e ele é o ÚNICO canal de escrita guest->host que resta.
+#
+# Ele é seguro por construção: um diretório fora de qualquer .git, sem nada
+# executável, do qual o host só faz `[ -e ]` e `rm -f`. O `--allow-host-writes`
+# existe por causa dele, e o mount do repo continua sem `:rw`.
+SIGNAL="$REPO/.fm-vm-signal"
+RELAY_PID=""
+MARKER=""
+MARKER_STATUS=""
+STATUS=""
+# Usadas pelo relay E uma última vez depois do run: o hook do ÚLTIMO turno
+# dispara a milissegundos do claude sair, então sem esse dreno final o wrapper
+# mataria o relay antes do poll de 1s enxergar o marker e o firstmate perderia
+# justamente o turn-end que decide o autoarm. O mesmo vale para a linha `done:`,
+# que o agente escreve imediatamente antes de encerrar.
+drain_turnend() {
+  [ -n "$MARKER" ] && [ -e "$MARKER" ] || return 0
+  rm -f "$MARKER"
+  touch "$TURNEND"
+}
+drain_status() {
+  [ -n "$MARKER_STATUS" ] && [ -s "$MARKER_STATUS" ] || return 0
+  # `mv` antes de ler, e não truncagem depois: dentro do mesmo mount o rename é
+  # atômico, então uma linha escrita pelo guest entre a leitura e a limpeza cai
+  # no arquivo NOVO e sai no ciclo seguinte, em vez de sumir. Perder um `done:`
+  # por corrida de 1 s deixaria o firstmate esperando para sempre.
+  mv -f "$MARKER_STATUS" "$MARKER_STATUS.drenando" 2>/dev/null || return 0
+  # Só `cat`: o conteúdo vem do guest e nunca é avaliado como comando aqui.
+  cat "$MARKER_STATUS.drenando" >> "$STATUS" 2>/dev/null || true
+  rm -f "$MARKER_STATUS.drenando"
+}
+
+if [ -n "$TURNEND" ]; then
+  # O guarda de aspas/barras no caminho do worktree saiu junto com o hook que
+  # interpolava $WT: o comando do hook agora é a constante `touch
+  # /fmsignal/turnend`, então não há caminho do host para escapar.
+  [ -d "$(dirname "$TURNEND")" ] || {
+    echo "erro: dir de $TURNEND não existe — --turnend errado?" >&2
+    exit 1
+  }
+
+  mkdir -p "$SIGNAL"
+  MARKER="$SIGNAL/turnend"
+  rm -f "$MARKER"
+
+  # O caminho do status é DERIVADO do de turn-end porque o fm-spawn constrói os
+  # dois do mesmo par (fm-spawn.sh:1325, `TURNEND="$STATE_REAL/$ID.turn-ended"`;
+  # o brief usa `$STATE/$ID.status`). Derivar evita uma segunda flag que poderia
+  # ficar dessincronizada da primeira.
+  STATUS="${TURNEND%.turn-ended}.status"
+  MARKER_STATUS="$SIGNAL/status"
+  rm -f "$MARKER_STATUS" "$MARKER_STATUS.drenando"
+
+  # O hook de Stop NÃO é mais escrito aqui. Ele precisa aparecer onde o claude
+  # do guest vai procurar, que agora é o clone em /work — e esse diretório só
+  # existe depois do clone, dentro da VM. Quem o escreve é o script do guest.
+  # O arquivo que o fm-spawn deixou em <worktree>/.claude fica órfão e inerte:
+  # ninguém o lê nesta geometria.
+
+  # info/exclude do repo principal (não do worktree): o diretório de sinal fica
+  # na raiz do REPO, então é lá que ele precisa ser ignorado. Mesmo mecanismo do
+  # exclude_path do fm-spawn (linha 1326) — não polui o .gitignore versionado.
+  #
+  # `--git-path` devolve caminho RELATIVO (medido em 30/jul/2026: `.git/info/
+  # exclude`), e relativo ao cwd de quem chama — que sob o firstmate é o worktree
+  # do treehouse, onde `.git` é um ARQUIVO. Sem absolutizar, o `mkdir -p .git/
+  # info` morria com "mkdir: .git: Not a directory" e o `set -e` derrubava o
+  # spawn inteiro. Rodando do checkout primário o mesmo código passava, porque lá
+  # `.git` é diretório — o bug só aparecia no caminho que importa.
+  EXCL=$(git -C "$REPO" rev-parse --git-path info/exclude 2>/dev/null || true)
+  case "$EXCL" in
+    '')  ;;
+    /*)  ;;
+    *)   EXCL="$REPO/$EXCL" ;;
+  esac
+  if [ -n "$EXCL" ]; then
+    mkdir -p "$(dirname "$EXCL")"
+    grep -qxF '/.fm-vm-signal/' "$EXCL" 2>/dev/null || echo '/.fm-vm-signal/' >> "$EXCL"
+  fi
+
+  # O fm-spawn grava <worktree>/.claude/settings.local.json com o hook de Stop do
+  # host (fm-spawn.sh:1336) e o adiciona ao info/exclude. Nesta geometria esse
+  # arquivo e INERTE — o claude roda no /work, dentro da VM — e num repo que ja
+  # RASTREIA esse caminho o exclude nao ajuda em nada: o worktree fica sujo, o
+  # fm-teardown recusa devolve-lo ("uncommitted changes") e a tarefa seguinte
+  # nasce em cima da sujeira. Medido no meu-projeto em 30/jul/2026.
+  #
+  # So desfazemos quando o arquivo e RASTREADO: onde o repo o ignora, a escrita
+  # do fm-spawn e inofensiva e nao ha nada a restaurar. E so aqui dentro, sob
+  # --turnend, porque fora do firstmate ninguem escreveu esse arquivo e um
+  # `checkout --` descartaria edicao legitima do humano.
+  if git -C "$WT" ls-files --error-unmatch .claude/settings.local.json >/dev/null 2>&1; then
+    git -C "$WT" checkout -- .claude/settings.local.json 2>/dev/null || true
+  fi
+
+  WRAPPER_PID=$$
+  (
+    while :; do
+      # `kill -0` no wrapper cobre o caso em que o trap não roda (SIGKILL no
+      # pane): sem isso um respawn deixaria relays órfãos acumulando.
+      kill -0 "$WRAPPER_PID" 2>/dev/null || exit 0
+      # Status antes de turn-end, nos dois drenos: cada append no arquivo de
+      # status acorda o firstmate, e ele deve encontrar a linha JÁ lá quando o
+      # turn-end o fizer olhar.
+      drain_status
+      drain_turnend
+      sleep 1
+    done
+  ) &
+  RELAY_PID=$!
+  # `cleanup_ghcred` entra JUNTO porque `trap` substitui em vez de acumular: sem
+  # ela aqui, instalar este trap apagaria a limpeza do diretorio do PAT.
+  # shellcheck disable=SC2064  # expandir o PID agora é intencional: PID fixo
+  trap "kill $RELAY_PID 2>/dev/null || true; cleanup_ghcred" EXIT HUP INT TERM
+fi
+
+# --- launch -----------------------------------------------------------------
+# O cwd default do guest é `/` (medido), daí o `cd` explícito. O `env` roda
+# DENTRO do guest para que as variáveis não dependam de o shuru propagar
+# ambiente do host.
+#
+# IS_SANDBOX=1 não é decorativo: a imagem-base do shuru só tem root (medido —
+# `id` dá uid=0 e /etc/passwd não tem outro usuário com shell), e o claude
+# recusa `--dangerously-skip-permissions` como root. IS_SANDBOX é o escape para
+# ambientes já isolados, e aqui a premissa dele é verdadeira de fato: quem
+# confina não é o uid, é a microVM. Sem isso o launch morre com
+# "cannot be used with root/sudo privileges".
+GUEST='
+set -e
+REPO=$1; NAME=$2; EMAIL=$3; SINAL=$4; NM=$5; S1=$6; shift 6
+
+# Clone local. O mount do repo é um overlay (medido: `df --output=fstype` dá
+# `overlay`), então commit feito nele vai para o upperdir e some no fim do boot,
+# SEM erro nenhum. O clone é do próprio mount — não usa rede, é instantâneo — e
+# entrega ao guest um .git de verdade no disco ext4 da VM.
+[ -d "$REPO" ] || { echo "claude-shuru: $REPO não existe na VM (mount falhou?)" >&2; exit 1; }
+if [ ! -d /work ]; then
+  git clone -q "$REPO" /work || { echo "claude-shuru: git clone do mount falhou" >&2; exit 1; }
+fi
+cd /work
+
+# O claude grava as permissoes que aceita em .claude/settings.local.json ao longo
+# da sessao. Onde esse arquivo e RASTREADO — o meu-projeto e um caso, medido em
+# 30/jul/2026 — o `git add -A` do shuru-pr varreria esse ruido de runtime para
+# dentro do PR, misturado ao trabalho de verdade. `skip-worktree` manda o git
+# ignorar mudancas locais nele sem desrastrea-lo, e vale para qualquer comando,
+# nao so para o shuru-pr. Onde o repo ja ignora o arquivo, o `ls-files` falha e
+# nao ha nada a fazer.
+if git ls-files --error-unmatch .claude/settings.local.json >/dev/null 2>&1; then
+  git update-index --skip-worktree .claude/settings.local.json || true
+fi
+
+if [ -n "$NAME" ] && [ -n "$EMAIL" ]; then
+  GIT_AUTHOR_NAME=$NAME; GIT_COMMITTER_NAME=$NAME
+  GIT_AUTHOR_EMAIL=$EMAIL; GIT_COMMITTER_EMAIL=$EMAIL
+  export GIT_AUTHOR_NAME GIT_COMMITTER_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL
+fi
+
+# O TOKEN VEM DE /ghcred/token, um mount read-only que o host so cria quando ha
+# PAT. Ate 18/ago/2026 ele vinha por variavel de ambiente contendo um
+# PLACEHOLDER, trocado pelo valor real no egress pelo proxy do shuru; desde a
+# migracao para PAT de vida longa o valor real esta aqui dentro, literal.
+#
+# A checagem e a EXISTENCIA DO ARQUIVO, nao `-n` na variavel, e isso conserta
+# de graca a armadilha medida em 01/ago/2026: com o canal antigo, a etapa 1
+# subia com GH_TOKEN preenchido pelo placeholder mesmo sem o host ter valor
+# nenhum, e o guest respondia `The token in GH_TOKEN is invalid`. Token
+# invalido era PIOR que token ausente: o Available() do no-mistakes roda
+# `gh auth status`, trata saida != 0 como "nao autenticado" e PULA `pr` e `ci`
+# EM SILENCIO, com o run reportando `outcome: passed`. Foi assim que a corrida
+# de 31/jul/2026 pareceu completa sem ter aberto PR nenhum. Sem mount, sem
+# arquivo, sem variavel: ausencia agora e ausencia de verdade.
+unset GH_TOKEN GITHUB_TOKEN GITHUB_BASIC 2>/dev/null || true
+if [ "$S1" != 1 ] && [ -r /ghcred/token ]; then
+  GITHUB_TOKEN=$(cat /ghcred/token)
+  export GITHUB_TOKEN
+
+  # Autenticacao do git por AMBIENTE, nunca gravada no .git/config e nunca em
+  # argv. A codificacao base64 acontece AQUI, no guest — antes ela tinha que
+  # ser feita no host, porque o proxy substituia texto literal e um base64
+  # feito aqui destruiria o placeholder como substring. Com o valor real
+  # presente, essa contorcao deixou de existir.
+  # Aspas DUPLAS, e nao simples, e isto NAO e estilo: todo este bloco vive
+  # dentro da string GUEST, que o host delimita com aspas simples. Uma unica
+  # aspa simples aqui a fecharia no meio. A quebra e silenciosa — o `sh -n` do
+  # arquivo inteiro continua passando, porque o resto ainda casa —, entao o
+  # sintoma so aparece como comportamento estranho dentro da VM. Aconteceu ao
+  # escrever este proprio comentario, em 18/ago/2026.
+  # O escape de nova linha entre aspas duplas chega intacto ao `tr`, que e
+  # quem o interpreta.
+  GITHUB_BASIC=$(printf "x-access-token:%s" "$GITHUB_TOKEN" | base64 | tr -d "\n")
+  GIT_CONFIG_COUNT=1
+  GIT_CONFIG_KEY_0=http.extraheader
+  GIT_CONFIG_VALUE_0="Authorization: Basic $GITHUB_BASIC"
+  export GITHUB_BASIC GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
+  # O gh le GH_TOKEN; o no-mistakes NAO le — ele roda `gh auth status
+  # --hostname` e trata exit!=0 como nao-autenticado, pulando pr e ci em
+  # silencio. Por isso a variavel do gh tem que estar posta, e nao so a nossa.
+  GH_TOKEN=$GITHUB_TOKEN
+  export GH_TOKEN
+fi
+
+# --- pipeline do no-mistakes, dentro do guest --------------------------------
+# TUDO isto acontece ANTES de o agente existir, e nao e detalhe de ordem: o
+# daemon precisa nascer ja com o ambiente completo. Sem launchd nem systemd aqui,
+# o no-mistakes cai no startDetachedDaemon, que HERDA o ambiente de quem o
+# inicia — ao contrario do host, onde o launchd entrega ambiente minimo e so
+# repassa as variaveis de proxy (proxyEnvKeys em internal/daemon/service.go).
+# Esse herdar e o unico motivo pelo qual este desenho funciona.
+if [ "$NM" = 1 ]; then
+  # O origin do clone e o proprio mount, que nao e remoto de verdade. Herdamos a
+  # URL canonica do repo-pai — mesma logica do shuru-pr.sh, e pelo mesmo motivo:
+  # exigir um `git remote set-url` decorado e um passo que se esquece e falha
+  # tarde. Sem sed: expansao de parametro nao briga com as aspas deste bloco.
+  PAI=$(git -C "$REPO" remote get-url origin 2>/dev/null) || PAI=""
+  SLUG=${PAI%.git}
+  SLUG=${SLUG#https://github.com/}
+  SLUG=${SLUG#git@github.com:}
+  case "$SLUG" in
+    */*) ;;
+    *) echo "claude-shuru: nao derivei OWNER/REPO de [$PAI]; no-mistakes abortado" >&2
+       exit 1 ;;
+  esac
+  git remote set-url origin "https://github.com/$SLUG.git"
+
+
+  # Falha aqui e fatal de proposito. Um daemon meio de pe deixaria o agente
+  # receber a instrucao de rodar /no-mistakes e bater num erro la na frente,
+  # depois de ja ter feito o trabalho caro.
+  no-mistakes daemon start >/dev/null 2>&1 || {
+    echo "claude-shuru: no-mistakes daemon nao subiu no guest" >&2; exit 1; }
+  # /work nasce de novo a cada boot, entao o gate (bare repo + hook
+  # post-receive) tambem precisa. Tolera repo ja inicializado.
+  no-mistakes init >/dev/null 2>&1 || true
+  # O `|| true` acima nao pode ficar sozinho. O gate nao mora na arvore de
+  # trabalho — fica em ~/.no-mistakes/repos/<hash>.git, e o que o liga ao repo e
+  # um remote chamado `no-mistakes` (medido no host em 01/ago/2026; procurar por
+  # /work/.no-mistakes nao acha nada, e isso e por desenho, nao falha). Entao a
+  # unica evidencia barata de que o init funcionou e o remote existir.
+  git remote get-url no-mistakes >/dev/null 2>&1 || {
+    echo "claude-shuru: no-mistakes init nao criou o remote do gate no guest" >&2
+    exit 1; }
+  # O doctor e do SISTEMA, nao do repo: ele checa git/gh/daemon/agentes e passa
+  # igual num repo sem gate nenhum (medido). Serve como checagem de ambiente,
+  # nunca como prova de que este repo esta inicializado — essa e a linha acima.
+  no-mistakes doctor >/dev/null 2>&1 || {
+    echo "claude-shuru: no-mistakes doctor reprovou o guest" >&2; exit 1; }
+fi
+
+# Hook de Stop por `--settings`, e NAO escrito em arquivo nenhum.
+#
+# A versao anterior gravava /work/.claude/settings.local.json. Medido em
+# 30/jul/2026 no meu-projeto: esse arquivo e RASTREADO ali (`git ls-files
+# --error-unmatch` confirma), e o shuru-pr faz `git add -A` — a sobrescrita
+# entraria no PR, destruindo a config do repo em nome de um sinal de turno.
+# Nao da para depender de o projeto ignorar o arquivo; muitos ignoram, este nao.
+#
+# `claude --settings <file-or-json>` aceita JSON na propria linha de comando e o
+# soma aos settings do projeto, entao o hook existe so no processo e o repo fica
+# intocado. As aspas duplas vao escapadas porque este bloco inteiro e uma string
+# de aspas SIMPLES no host: o `\"` chega literal ao guest e vira `"` dentro das
+# aspas duplas do shell do guest.
+# TRES DIALOGOS INTERATIVOS bloqueavam o crewmate aqui, e um agente lancado pelo
+# firstmate nao tem quem os responda — a tarefa simplesmente ficava parada numa
+# TUI. Medidos em 30/jul/2026, na ordem em que apareceram:
+#
+#   1. confianca no workspace ("Is this a project you created or one you trust?"),
+#      porque /work e um diretorio novo a cada boot;
+#   2. servidor MCP do projeto (este repo declara `gdrive`);
+#   3. aceite do modo bypass-permissions.
+#
+# O (2) morre com `--strict-mcp-config` sem nenhum `--mcp-config`: nenhum MCP e
+# carregado, o que alias e o unico estado honesto aqui — a rede da VM e allowlist
+# de egresso e nenhum servidor MCP do projeto teria rota.
+#
+# (1) e (3) sao estado persistido, nao flags, entao ficam no ~/.claude.json do
+# guest. Semeamos por MERGE em python3 (que a imagem-base tem) em vez de
+# sobrescrever: o arquivo pode ja existir na imagem, e um `cat >` apagaria o que
+# houvesse ali. Escopo: um arquivo dentro da VM descartavel, nunca o do host.
+CFG="${HOME:-/}/.claude.json"
+python3 - "$CFG" <<"PY"
+import json, sys
+p = sys.argv[1]
+try:
+    cfg = json.load(open(p))
+except Exception:
+    cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+cfg["bypassPermissionsModeAccepted"] = True
+projs = cfg.get("projects")
+if not isinstance(projs, dict):
+    projs = {}
+    cfg["projects"] = projs
+ent = projs.get("/work")
+if not isinstance(ent, dict):
+    ent = {}
+    projs["/work"] = ent
+ent["hasTrustDialogAccepted"] = True
+json.dump(cfg, open(p, "w"))
+PY
+
+if [ "$SINAL" = 1 ]; then
+  exec env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false IS_SANDBOX=1 \
+    claude --dangerously-skip-permissions --strict-mcp-config \
+      --settings "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"touch /fmsignal/turnend\"}]}]}}" \
+      "$@"
+fi
+
+exec env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false IS_SANDBOX=1 \
+  claude --dangerously-skip-permissions --strict-mcp-config "$@"
+'
+
+cd "$REPO"
+# `--mount` SOMA aos mounts do shuru.json (medido), então só o que é desta
+# geometria entra aqui. Espelhado no mesmo caminho absoluto nos dois lados: é o
+# que faz o `gitdir:` do worktree linked resolver dentro do guest.
+#
+# SEM `:rw` no repo — é o ponto inteiro da mudança. O `--allow-host-writes`
+# abaixo existe só para o mount de sinal; ele não afeta o mount do repo, que
+# continua chegando ao guest como overlay descartável (medido).
+#
+# Construído por prefixação porque `sh` não tem array: os argumentos do claude
+# já estão em "$@" e precisam ficar no fim.
+if [ -n "$MARKER" ]; then SINAL_FLAG=1; else SINAL_FLAG=0; fi
+if [ -n "$STAGE1_CP" ]; then S1_FLAG=1; else S1_FLAG=0; fi
+set -- sh -c "$GUEST" claude-shuru "$REPO" "$GIT_NAME" "$GIT_EMAIL" "$SINAL_FLAG" "$NM" \
+         "$S1_FLAG" "$@"
+set -- -- "$@"
+# `checkpoint create` quer o NOME entre as opções e o comando (`checkpoint create
+# [OPTIONS] <NAME> [COMMAND]`), então ele entra aqui, depois do `--` já ter sido
+# prefixado e antes dos mounts.
+[ -z "$STAGE1_CP" ] || set -- "$STAGE1_CP" "$@"
+if [ -n "$MARKER" ]; then
+  set -- --mount "${SIGNAL}:/fmsignal:rw" --allow-host-writes "$@"
+fi
+# Sem `:rw` — o guest so precisa LER o token. E sem mount nenhum quando nao ha
+# PAT, que e o que faz "sem token" ser distinguivel de "token invalido" la
+# dentro (ver o ramo /ghcred no $GUEST).
+if [ -n "$GHCRED" ]; then
+  set -- --mount "${GHCRED}:/ghcred:ro" "$@"
+fi
+# `run` descarta o disco no fim; `checkpoint create` o salva. É a diferença
+# inteira entre as duas etapas: na 1 o trabalho precisa sobreviver ao boot para
+# que a 2 possa cunhar um token novo e só então empurrar.
+if [ -n "$STAGE1_CP" ]; then
+  set -- "$SHURU" checkpoint create --from "$CHECKPOINT" $REDE \
+           --mount "${REPO}:${REPO}" "$@"
+else
+  set -- "$SHURU" run --from "$CHECKPOINT" $REDE --mount "${REPO}:${REPO}" "$@"
+fi
+
+# `exec` substitui o processo, e processo substituido NAO roda trap EXIT — o
+# diretorio do PAT ficaria no /tmp do host para sempre. Entao o exec so vale
+# quando nao ha nada a limpar.
+if [ -z "$RELAY_PID" ] && [ -z "$GHCRED" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" exec "$@"
+fi
+if [ -z "$RELAY_PID" ]; then
+  RC=0
+  CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" "$@" || RC=$?
+  cleanup_ghcred
+  exit "$RC"
+fi
+# Com relay ativo não dá `exec`: o trap precisa de um processo vivo para rodar.
+RC=0
+CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" "$@" || RC=$?
+kill "$RELAY_PID" 2>/dev/null || true
+drain_status
+drain_turnend
+cleanup_ghcred
+exit "$RC"

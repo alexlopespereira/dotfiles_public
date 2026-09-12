@@ -1,0 +1,23 @@
+{
+  "_comment": "Copie para ~/.config/av-broker/config.json (0600). Ver broker/README.md.",
+
+  "_github": "removido em 18/ago/2026: o alvo github saiu do broker em favor de dois PATs fine-grained de vida longa (keychain `github-pat` no Mac, `github-pat-vm` para o container/VM). Com ele saiu o subsistema de agente. GCP e Salesforce seguem aqui.",
+
+  "gcp": {
+    "_broker_sa_email": "preenchido por broker/gcp/setup-sa-broker.sh",
+    "broker_sa_email": null,
+    "key_provider": "keychain:av-broker-gcp"
+  },
+
+  "policy": {
+    "_session_ttl_seconds": "teto rígido de 8h no código (ADR §6.5); valor maior é rejeitado pelo doctor",
+    "session_ttl_seconds": 28800,
+
+    "_gate": "auto | touchid | gui | tty. 'auto' pega o mais forte disponível (touchid > gui > tty). Nesta máquina (Mac mini sem teclado biométrico) resolve para 'gui'. Override pontual: AV_BROKER_GATE=tty",
+    "gate": "auto"
+  },
+
+  "paths": {
+    "state_dir": "~/.local/state/av-broker"
+  }
+}

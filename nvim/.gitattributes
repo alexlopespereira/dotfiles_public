@@ -1,0 +1,4 @@
+# Script de shell precisa de LF mesmo em checkout no Windows:
+# com CRLF o shebang vira "#!/bin/sh" e o macOS/Linux recusa com
+# "bad interpreter". O repo tem core.autocrlf=true nesta maquina.
+*.sh text eol=lf

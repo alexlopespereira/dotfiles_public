@@ -1,0 +1,18 @@
+# Config do treehouse (pool de git worktrees reusaveis).
+#
+# root = "./" e resolvido relativo ao REPO, nao ao $HOME — medido em 29/jul/2026:
+# sem treehouse.toml no projeto, o pool foi para
+# <repo>/.treehouse/<nome>-<hash>/<slot>/<nome>. E isso que mantem o worktree
+# DENTRO do repo, entao a VM shuru que monta so o repo alcanca ele sem precisar
+# de um mount novo. Com o default (root vazio => $HOME/.treehouse) o worktree
+# cairia fora de ~/Projects e o mount da VM nao chegaria nele.
+#
+# NAO rode `treehouse init` dentro de um projeto. Ele cria um treehouse.toml no
+# repo, e o Load() (internal/config/config.go) passa a ler deste arquivo aqui
+# SOMENTE os hooks — root e max_trees viram os do repo. Ou seja, um init
+# silenciosamente desliga esta configuracao central.
+#
+# Na primeira aquisicao o treehouse adiciona "/.treehouse" ao .gitignore do repo
+# alvo por conta propria (internal/config/gitignore.go). Esperado, nao e sujeira.
+max_trees = 16
+root = "./"
