@@ -14,9 +14,6 @@ específicos pertencem às skills e aos runbooks; consulte-os quando a tarefa ex
 - Preserve alterações alheias à tarefa. Use `gh` para operações no GitHub.
 - Specs e tickets ficam em `.scratch/<feature>/`, com critérios de aceite e
   dependências explícitos. Publique-os somente quando solicitado.
-- Use Codex como executor e revisor. Falha de autenticação ou quota exige
-  preservar o trabalho e relatar o bloqueio, sem fallback automático para Claude
-  ou API paga. Não inicie loops, gates ou agentes por mera disponibilidade.
 
 ## Segurança
 
