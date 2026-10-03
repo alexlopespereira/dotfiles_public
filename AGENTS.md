@@ -1,4 +1,4 @@
-# Instruções do projeto
+# Instruções Gerais
 
 Mantenha aqui decisões e armadilhas úteis à maioria das sessões. Procedimentos
 específicos pertencem às skills e aos runbooks; consulte-os quando a tarefa exigir.
